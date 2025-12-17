@@ -28,6 +28,7 @@ type ClientConnection struct {
 	recvQueue  chan []byte
 	clientIP   net.IP
 	stopCh     chan struct{}
+	stopOnce   sync.Once
 	wg         sync.WaitGroup
 }
 
@@ -150,7 +151,9 @@ func (t *Tunnel) addClient(client *ClientConnection, ip net.IP) {
 	ipStr := ip.String()
 	if existing, ok := t.clients[ipStr]; ok {
 		log.Printf("Warning: IP conflict detected for %s, closing old connection", ipStr)
-		close(existing.stopCh)
+		existing.stopOnce.Do(func() {
+			close(existing.stopCh)
+		})
 		existing.conn.Close()
 	}
 
@@ -311,7 +314,10 @@ func (t *Tunnel) acceptClients(listener *tcp_disguise.Listener) {
 
 		conn, err := listener.Accept()
 		if err != nil {
-			if !isClosed(t.stopCh) {
+			select {
+			case <-t.stopCh:
+				// Tunnel is stopping, no need to log
+			default:
 				log.Printf("Accept error: %v", err)
 			}
 			return
@@ -379,7 +385,10 @@ func (t *Tunnel) tunReader() {
 
 		n, err := t.tunFile.Read(buf)
 		if err != nil {
-			if !isClosed(t.stopCh) {
+			select {
+			case <-t.stopCh:
+				// Tunnel is stopping, no need to log
+			default:
 				log.Printf("TUN read error: %v", err)
 			}
 			return
@@ -416,7 +425,10 @@ func (t *Tunnel) tunReaderServer() {
 
 		n, err := t.tunFile.Read(buf)
 		if err != nil {
-			if !isClosed(t.stopCh) {
+			select {
+			case <-t.stopCh:
+				// Tunnel is stopping, no need to log
+			default:
 				log.Printf("TUN read error: %v", err)
 			}
 			return
@@ -431,7 +443,7 @@ func (t *Tunnel) tunReaderServer() {
 		copy(packet, buf[:n])
 
 		// Parse destination IP from packet (IPv4)
-		// IP header: version(4 bits) + IHL(4 bits) + ... + dst IP (16 bytes offset for IPv4)
+		// IP header: version(4 bits) + IHL(4 bits) + ... + dst IP (4 bytes starting at offset 16 for IPv4)
 		if packet[0]>>4 != 4 {
 			// Not IPv4, skip
 			continue
@@ -464,7 +476,10 @@ func (t *Tunnel) tunWriter() {
 			return
 		case packet := <-t.recvQueue:
 			if _, err := t.tunFile.Write(packet); err != nil {
-				if !isClosed(t.stopCh) {
+				select {
+				case <-t.stopCh:
+					// Tunnel is stopping, no need to log
+				default:
 					log.Printf("TUN write error: %v", err)
 				}
 				return
@@ -486,7 +501,10 @@ func (t *Tunnel) netReader() {
 
 		packet, err := t.conn.ReadPacket()
 		if err != nil {
-			if !isClosed(t.stopCh) {
+			select {
+			case <-t.stopCh:
+				// Tunnel is stopping, no need to log
+			default:
 				log.Printf("Network read error: %v", err)
 			}
 			return
@@ -531,7 +549,10 @@ func (t *Tunnel) netWriter() {
 			copy(fullPacket[1:], packet)
 
 			if err := t.conn.WritePacket(fullPacket); err != nil {
-				if !isClosed(t.stopCh) {
+				select {
+				case <-t.stopCh:
+					// Tunnel is stopping, no need to log
+				default:
 					log.Printf("Network write error: %v", err)
 				}
 				return
@@ -555,7 +576,10 @@ func (t *Tunnel) keepalive() {
 			return
 		case <-ticker.C:
 			if err := t.conn.WritePacket(keepalivePacket); err != nil {
-				if !isClosed(t.stopCh) {
+				select {
+				case <-t.stopCh:
+					// Tunnel is stopping, no need to log
+				default:
 					log.Printf("Keepalive error: %v", err)
 				}
 				return
@@ -579,10 +603,17 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 
 		packet, err := client.conn.ReadPacket()
 		if err != nil {
-			if !isClosed(t.stopCh) && !isClosed(client.stopCh) {
+			select {
+			case <-t.stopCh:
+				// Tunnel is stopping, no need to log
+			case <-client.stopCh:
+				// Client already stopped, no need to log
+			default:
 				log.Printf("Client network read error from %s: %v", client.conn.RemoteAddr(), err)
 			}
-			close(client.stopCh)
+			client.stopOnce.Do(func() {
+				close(client.stopCh)
+			})
 			return
 		}
 
@@ -627,7 +658,10 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 					
 					// Write to TUN device for server
 					if _, err := t.tunFile.Write(payload); err != nil {
-						if !isClosed(t.stopCh) {
+						select {
+						case <-t.stopCh:
+							// Tunnel is stopping, no need to log
+						default:
 							log.Printf("TUN write error: %v", err)
 						}
 						return
@@ -649,7 +683,10 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 					} else {
 						// Send to TUN device (for server or unknown destination)
 						if _, err := t.tunFile.Write(payload); err != nil {
-							if !isClosed(t.stopCh) {
+							select {
+							case <-t.stopCh:
+								// Tunnel is stopping, no need to log
+							default:
 								log.Printf("TUN write error: %v", err)
 							}
 							return
@@ -680,10 +717,17 @@ func (t *Tunnel) clientNetWriter(client *ClientConnection) {
 			copy(fullPacket[1:], packet)
 
 			if err := client.conn.WritePacket(fullPacket); err != nil {
-				if !isClosed(t.stopCh) && !isClosed(client.stopCh) {
+				select {
+				case <-t.stopCh:
+					// Tunnel is stopping, no need to log
+				case <-client.stopCh:
+					// Client already stopped, no need to log
+				default:
 					log.Printf("Client network write error to %s: %v", client.conn.RemoteAddr(), err)
 				}
-				close(client.stopCh)
+				client.stopOnce.Do(func() {
+					close(client.stopCh)
+				})
 				return
 			}
 		}
@@ -707,25 +751,23 @@ func (t *Tunnel) clientKeepalive(client *ClientConnection) {
 			return
 		case <-ticker.C:
 			if err := client.conn.WritePacket(keepalivePacket); err != nil {
-				if !isClosed(t.stopCh) && !isClosed(client.stopCh) {
+				select {
+				case <-t.stopCh:
+					// Tunnel is stopping, no need to log
+				case <-client.stopCh:
+					// Client already stopped, no need to log
+				default:
 					log.Printf("Client keepalive error to %s: %v", client.conn.RemoteAddr(), err)
 				}
-				close(client.stopCh)
+				client.stopOnce.Do(func() {
+					close(client.stopCh)
+				})
 				return
 			}
 		}
 	}
 }
 
-// isClosed checks if a channel is closed
-func isClosed(ch chan struct{}) bool {
-	select {
-	case <-ch:
-		return true
-	default:
-		return false
-	}
-}
 
 // Helper to get local IP for the other peer
 func GetPeerIP(tunnelAddr string) (string, error) {
