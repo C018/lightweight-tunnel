@@ -19,6 +19,12 @@ import (
 const (
 	PacketTypeData      = 0x01
 	PacketTypeKeepalive = 0x02
+
+	// IPv4 constants
+	IPv4Version      = 4
+	IPv4SrcIPOffset  = 12
+	IPv4DstIPOffset  = 16
+	IPv4MinHeaderLen = 20
 )
 
 // ClientConnection represents a single client connection
@@ -126,7 +132,9 @@ func (t *Tunnel) Stop() {
 	// Close all client connections (server mode)
 	t.clientsMux.Lock()
 	for _, client := range t.clients {
-		close(client.stopCh)
+		client.stopOnce.Do(func() {
+			close(client.stopCh)
+		})
 		client.conn.Close()
 	}
 	t.clientsMux.Unlock()
@@ -434,7 +442,7 @@ func (t *Tunnel) tunReaderServer() {
 			return
 		}
 
-		if n < 20 { // Minimum IP header size
+		if n < IPv4MinHeaderLen {
 			continue
 		}
 
@@ -444,12 +452,12 @@ func (t *Tunnel) tunReaderServer() {
 
 		// Parse destination IP from packet (IPv4)
 		// IP header: version(4 bits) + IHL(4 bits) + ... + dst IP (4 bytes starting at offset 16 for IPv4)
-		if packet[0]>>4 != 4 {
+		if packet[0]>>4 != IPv4Version {
 			// Not IPv4, skip
 			continue
 		}
 
-		dstIP := net.IP(packet[16:20])
+		dstIP := net.IP(packet[IPv4DstIPOffset : IPv4DstIPOffset+4])
 
 		// Find the client with this destination IP
 		client := t.getClientByIP(dstIP)
@@ -627,13 +635,13 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 
 		switch packetType {
 		case PacketTypeData:
-			if len(payload) < 20 {
+			if len(payload) < IPv4MinHeaderLen {
 				continue
 			}
 
 			// Extract source IP from the packet to register client
-			if payload[0]>>4 == 4 { // IPv4
-				srcIP := net.IP(payload[12:16])
+			if payload[0]>>4 == IPv4Version { // IPv4
+				srcIP := net.IP(payload[IPv4SrcIPOffset : IPv4SrcIPOffset+4])
 				
 				// Register client IP if not yet registered
 				if client.clientIP == nil {
@@ -641,22 +649,12 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 				}
 
 				// Route packet based on destination
-				dstIP := net.IP(payload[16:20])
+				dstIP := net.IP(payload[IPv4DstIPOffset : IPv4DstIPOffset+4])
 				
 				// Check if destination is another client
 				if t.config.ClientIsolation {
-					// In isolation mode, only forward to TUN device (for server)
-					select {
-					case client.recvQueue <- payload:
-					case <-t.stopCh:
-						return
-					case <-client.stopCh:
-						return
-					default:
-						log.Printf("Client receive queue full, dropping packet")
-					}
-					
-					// Write to TUN device for server
+					// In isolation mode, only send to TUN device (server)
+					// Clients cannot communicate with each other
 					if _, err := t.tunFile.Write(payload); err != nil {
 						select {
 						case <-t.stopCh:

@@ -84,8 +84,9 @@ func LoadConfig(filename string) (*Config, error) {
 	if config.MaxClients == 0 {
 		config.MaxClients = 100
 	}
-	// MultiClient defaults to true for server mode
-	// ClientIsolation defaults to false
+	// Note: MultiClient and ClientIsolation default to false when loaded from JSON
+	// The command-line interface and DefaultConfig() set MultiClient=true by default
+	// Explicitly set "multi_client": true in JSON config for multi-client support
 
 	return &config, nil
 }
