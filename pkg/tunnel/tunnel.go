@@ -46,8 +46,8 @@ func NewTunnel(cfg *config.Config) (*Tunnel, error) {
 		config:    cfg,
 		fec:       fecCodec,
 		stopCh:    make(chan struct{}),
-		sendQueue: make(chan []byte, 100),
-		recvQueue: make(chan []byte, 100),
+		sendQueue: make(chan []byte, cfg.SendQueueSize),
+		recvQueue: make(chan []byte, cfg.RecvQueueSize),
 	}, nil
 }
 

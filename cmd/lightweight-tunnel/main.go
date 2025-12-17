@@ -26,6 +26,8 @@ func main() {
 	mtu := flag.Int("mtu", 1400, "MTU size")
 	fecData := flag.Int("fec-data", 10, "FEC data shards")
 	fecParity := flag.Int("fec-parity", 3, "FEC parity shards")
+	sendQueueSize := flag.Int("send-queue", 1000, "Send queue buffer size")
+	recvQueueSize := flag.Int("recv-queue", 1000, "Receive queue buffer size")
 	showVersion := flag.Bool("v", false, "Show version")
 	generateConfig := flag.String("g", "", "Generate example config file")
 	tlsEnabled := flag.Bool("tls", false, "Enable TLS encryption")
@@ -71,6 +73,8 @@ func main() {
 			FECParityShards:   *fecParity,
 			Timeout:           30,
 			KeepaliveInterval: 10,
+			SendQueueSize:     *sendQueueSize,
+			RecvQueueSize:     *recvQueueSize,
 			TLSEnabled:        *tlsEnabled,
 			TLSCertFile:       *tlsCertFile,
 			TLSKeyFile:        *tlsKeyFile,
@@ -94,6 +98,8 @@ func main() {
 	log.Printf("Tunnel Address: %s", cfg.TunnelAddr)
 	log.Printf("MTU: %d", cfg.MTU)
 	log.Printf("FEC: %d data + %d parity shards", cfg.FECDataShards, cfg.FECParityShards)
+	log.Printf("Send Queue Size: %d", cfg.SendQueueSize)
+	log.Printf("Receive Queue Size: %d", cfg.RecvQueueSize)
 	log.Printf("TLS Encryption: %v", cfg.TLSEnabled)
 	if !cfg.TLSEnabled {
 		log.Println("⚠️  WARNING: TLS disabled - traffic will be sent in PLAINTEXT")
