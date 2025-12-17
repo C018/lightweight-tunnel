@@ -16,6 +16,8 @@ type Config struct {
 	FECParityShards int  `json:"fec_parity"`     // Number of FEC parity shards
 	Timeout       int    `json:"timeout"`        // Connection timeout in seconds
 	KeepaliveInterval int `json:"keepalive"`    // Keepalive interval in seconds
+	SendQueueSize int    `json:"send_queue_size"` // Size of send queue buffer (default 1000)
+	RecvQueueSize int    `json:"recv_queue_size"` // Size of receive queue buffer (default 1000)
 	TLSEnabled    bool   `json:"tls_enabled"`    // Enable TLS encryption
 	TLSCertFile   string `json:"tls_cert_file"`  // Path to TLS certificate file (server mode)
 	TLSKeyFile    string `json:"tls_key_file"`   // Path to TLS private key file (server mode)
@@ -34,6 +36,8 @@ func DefaultConfig() *Config {
 		FECParityShards:   3,
 		Timeout:           30,
 		KeepaliveInterval: 10,
+		SendQueueSize:     1000,
+		RecvQueueSize:     1000,
 	}
 }
 
@@ -64,6 +68,12 @@ func LoadConfig(filename string) (*Config, error) {
 	}
 	if config.KeepaliveInterval == 0 {
 		config.KeepaliveInterval = 10
+	}
+	if config.SendQueueSize == 0 {
+		config.SendQueueSize = 1000
+	}
+	if config.RecvQueueSize == 0 {
+		config.RecvQueueSize = 1000
 	}
 
 	return &config, nil
