@@ -151,6 +151,35 @@ sudo lsof -i :9000
 sudo kill -9 PID
 ```
 
+### Second Client Connection Fails (EOF/Broken Pipe)
+
+**Problem**: Second client gets "Network read error: EOF" or "write: broken pipe"
+
+**Solution**: This happens when server is configured with `multi_client: false` (single-client mode). 
+
+If using a JSON configuration file:
+- Ensure `"multi_client": true` is set in the server config, OR
+- Remove the `multi_client` field entirely (defaults to `true`)
+
+```json
+{
+  "mode": "server",
+  "local_addr": "0.0.0.0:9000",
+  "tunnel_addr": "10.0.0.1/24",
+  "multi_client": true,
+  "max_clients": 100
+}
+```
+
+If using command line:
+```bash
+# Multi-client is enabled by default
+sudo ./bin/lightweight-tunnel -m server -l 0.0.0.0:9000 -t 10.0.0.1/24
+
+# Or explicitly enable
+sudo ./bin/lightweight-tunnel -m server -l 0.0.0.0:9000 -t 10.0.0.1/24 -multi-client
+```
+
 ## Performance Tuning
 
 ### For High-Speed Networks
