@@ -102,9 +102,14 @@ Example server configuration:
   "timeout": 30,
   "keepalive": 10,
   "send_queue_size": 1000,
-  "recv_queue_size": 1000
+  "recv_queue_size": 1000,
+  "multi_client": true,
+  "max_clients": 100,
+  "client_isolation": false
 }
 ```
+
+**Note**: If `multi_client` is not specified in server configuration files, it defaults to `true` to enable multiple simultaneous client connections. To disable multi-client support, explicitly set `"multi_client": false`.
 
 Example client configuration:
 
