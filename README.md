@@ -49,7 +49,7 @@ sudo ./lightweight-tunnel -m server -l 0.0.0.0:9000 -t 10.0.0.1/24
 
 **客户端：**
 ```bash
-sudo ./lightweight-tunnel -m client -r 服务器IP:9000 -t 10.0.0.2/24
+sudo ./lightweight-tunnel -m client -r <服务器IP>:9000 -t 10.0.0.2/24
 ```
 
 **测试连接：**
@@ -74,11 +74,11 @@ sudo ./lightweight-tunnel -m server -l 0.0.0.0:9000 -t 10.0.0.1/24 \
 **3. 启动客户端：**
 ```bash
 # 使用自签名证书（测试环境）
-sudo ./lightweight-tunnel -m client -r 服务器IP:9000 -t 10.0.0.2/24 \
+sudo ./lightweight-tunnel -m client -r <服务器IP>:9000 -t 10.0.0.2/24 \
   -tls -tls-skip-verify
 
 # 使用正式证书（生产环境）
-sudo ./lightweight-tunnel -m client -r 服务器IP:9000 -t 10.0.0.2/24 -tls
+sudo ./lightweight-tunnel -m client -r <服务器IP>:9000 -t 10.0.0.2/24 -tls
 ```
 
 #### 场景三：多客户端组网
@@ -92,17 +92,17 @@ sudo ./lightweight-tunnel -m server -l 0.0.0.0:9000 -t 10.0.0.1/24
 
 **客户端 1：**
 ```bash
-sudo ./lightweight-tunnel -m client -r 服务器IP:9000 -t 10.0.0.2/24
+sudo ./lightweight-tunnel -m client -r <服务器IP>:9000 -t 10.0.0.2/24
 ```
 
 **客户端 2：**
 ```bash
-sudo ./lightweight-tunnel -m client -r 服务器IP:9000 -t 10.0.0.3/24
+sudo ./lightweight-tunnel -m client -r <服务器IP>:9000 -t 10.0.0.3/24
 ```
 
 **客户端 3：**
 ```bash
-sudo ./lightweight-tunnel -m client -r 服务器IP:9000 -t 10.0.0.4/24
+sudo ./lightweight-tunnel -m client -r <服务器IP>:9000 -t 10.0.0.4/24
 ```
 
 连接后，客户端之间可以直接通信：
@@ -155,7 +155,7 @@ ssh user@10.0.0.4
 ```json
 {
   "mode": "client",
-  "remote_addr": "服务器IP:9000",
+  "remote_addr": "<服务器IP>:9000",
   "tunnel_addr": "10.0.0.2/24",
   "mtu": 1400,
   "fec_data": 10,
@@ -277,7 +277,7 @@ sudo modprobe tun
 1. 检查服务端是否运行：`netstat -tlnp | grep 9000`
 2. 检查防火墙：`sudo ufw allow 9000/tcp`
 3. 验证服务器 IP 地址是否正确
-4. 测试网络连通性：`ping 服务器IP`
+4. 测试网络连通性：`ping <服务器IP>`
 
 ### 第二个客户端连接失败（EOF/Broken Pipe）
 
