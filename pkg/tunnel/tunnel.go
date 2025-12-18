@@ -245,6 +245,9 @@ func (t *Tunnel) Stop() {
 			}
 		}
 		
+		// Signal all tunnel goroutines to stop
+		close(t.stopCh)
+		
 		// Close all client connections and signal client goroutines (server mode)
 		t.clientsMux.Lock()
 		for _, client := range t.clients {
@@ -259,9 +262,6 @@ func (t *Tunnel) Stop() {
 			})
 		}
 		t.clientsMux.Unlock()
-		
-		// Signal all tunnel goroutines to stop
-		close(t.stopCh)
 		
 		// Stop P2P manager
 		if t.p2pManager != nil {
@@ -1462,6 +1462,7 @@ func (t *Tunnel) broadcastPeerInfo(newClientIP net.IP, peerInfo string) {
 	
 	// Broadcast to all clients except the sender
 	t.clientsMux.RLock()
+	defer t.clientsMux.RUnlock()
 	for _, client := range t.clients {
 		if client.clientIP != nil && !client.clientIP.Equal(newClientIP) {
 			// Send directly to network connection (bypass sendQueue which is for data packets)
@@ -1477,5 +1478,4 @@ func (t *Tunnel) broadcastPeerInfo(newClientIP net.IP, peerInfo string) {
 			}
 		}
 	}
-	t.clientsMux.RUnlock()
 }
