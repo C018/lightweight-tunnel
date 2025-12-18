@@ -306,6 +306,45 @@ func (t *Tunnel) removeClient(client *ClientConnection) {
 		ipStr := client.clientIP.String()
 		delete(t.clients, ipStr)
 		log.Printf("Client unregistered: %s (remaining clients: %d)", ipStr, len(t.clients))
+		
+		// Also remove from routing table if mesh routing enabled
+		if t.routingTable != nil {
+			t.routingTable.RemovePeer(client.clientIP)
+			log.Printf("Removed peer %s from routing table", ipStr)
+		}
+		
+		// Broadcast peer disconnection to other clients
+		if t.config.P2PEnabled {
+			t.broadcastPeerDisconnect(client.clientIP)
+		}
+	}
+}
+
+// broadcastPeerDisconnect notifies all clients that a peer has disconnected
+func (t *Tunnel) broadcastPeerDisconnect(disconnectedIP net.IP) {
+	// Format: DISCONNECT|TunnelIP
+	disconnectInfo := fmt.Sprintf("DISCONNECT|%s", disconnectedIP.String())
+	
+	// Create peer info packet with disconnect message
+	fullPacket := make([]byte, len(disconnectInfo)+1)
+	fullPacket[0] = PacketTypePeerInfo
+	copy(fullPacket[1:], []byte(disconnectInfo))
+	
+	// Encrypt
+	encryptedPacket, err := t.encryptPacket(fullPacket)
+	if err != nil {
+		log.Printf("Failed to encrypt disconnect notification: %v", err)
+		return
+	}
+	
+	// Broadcast to all clients
+	// Note: clientsMux is already held by caller
+	for _, client := range t.clients {
+		if client.clientIP != nil && !client.clientIP.Equal(disconnectedIP) {
+			if err := client.conn.WritePacket(encryptedPacket); err != nil {
+				log.Printf("Failed to send disconnect notification to %s: %v", client.clientIP, err)
+			}
+		}
 	}
 }
 
@@ -1083,6 +1122,20 @@ func (t *Tunnel) handlePeerInfoFromServer(data []byte) {
 	// Format: TunnelIP|PublicAddr|LocalAddr
 	info := string(data)
 	parts := strings.Split(info, "|")
+	if len(parts) < 2 {
+		return
+	}
+	
+	// Check if this is a disconnect message first
+	if parts[0] == "DISCONNECT" {
+		disconnectedIP := net.ParseIP(parts[1])
+		if disconnectedIP != nil {
+			t.handlePeerDisconnect(disconnectedIP)
+		}
+		return
+	}
+	
+	// Normal peer info message requires at least 3 parts
 	if len(parts) < 3 {
 		return
 	}
@@ -1118,6 +1171,21 @@ func (t *Tunnel) handlePeerInfoFromServer(data []byte) {
 	}
 	
 	log.Printf("Received peer info from server: %s at %s (local: %s)", tunnelIP, peer.PublicAddr, peer.LocalAddr)
+}
+
+// handlePeerDisconnect handles notification that a peer has disconnected
+func (t *Tunnel) handlePeerDisconnect(peerIP net.IP) {
+	log.Printf("Peer %s disconnected, removing from routing table", peerIP)
+	
+	// Remove from routing table
+	if t.routingTable != nil {
+		t.routingTable.RemovePeer(peerIP)
+	}
+	
+	// Remove from P2P manager
+	if t.p2pManager != nil {
+		t.p2pManager.RemovePeer(peerIP)
+	}
 }
 
 // handleRouteInfoPacket handles route information updates

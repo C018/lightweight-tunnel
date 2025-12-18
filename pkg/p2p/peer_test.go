@@ -68,15 +68,36 @@ func TestPeerInfo_SetConnected(t *testing.T) {
 	peer.mu.RUnlock()
 }
 
+func TestPeerInfo_SetLocalConnection(t *testing.T) {
+	peer := NewPeerInfo(net.ParseIP("10.0.0.2"))
+	
+	peer.SetLocalConnection(true)
+	
+	peer.mu.RLock()
+	if !peer.IsLocalConnection {
+		t.Error("Peer should be marked as local connection")
+	}
+	peer.mu.RUnlock()
+	
+	peer.SetLocalConnection(false)
+	
+	peer.mu.RLock()
+	if peer.IsLocalConnection {
+		t.Error("Peer should not be marked as local connection")
+	}
+	peer.mu.RUnlock()
+}
+
 func TestPeerInfo_GetQualityScore(t *testing.T) {
 	tests := []struct {
-		name           string
-		latency        time.Duration
-		packetLoss     float64
-		connected      bool
-		throughServer  bool
-		expectedMin    int
-		expectedMax    int
+		name            string
+		latency         time.Duration
+		packetLoss      float64
+		connected       bool
+		throughServer   bool
+		isLocalConn     bool
+		expectedMin     int
+		expectedMax     int
 	}{
 		{
 			name:        "Perfect connection",
@@ -111,6 +132,15 @@ func TestPeerInfo_GetQualityScore(t *testing.T) {
 			expectedMin: 0,
 			expectedMax: 20,
 		},
+		{
+			name:        "Local network connection (highest priority)",
+			latency:     1 * time.Millisecond,
+			packetLoss:  0.0,
+			connected:   true,
+			isLocalConn: true,
+			expectedMin: 130,  // 100 base + 20 P2P bonus + 30 local bonus
+			expectedMax: 150,
+		},
 	}
 	
 	for _, tt := range tests {
@@ -121,6 +151,9 @@ func TestPeerInfo_GetQualityScore(t *testing.T) {
 			peer.SetConnected(tt.connected)
 			if tt.throughServer {
 				peer.SetThroughServer(true)
+			}
+			if tt.isLocalConn {
+				peer.SetLocalConnection(true)
 			}
 			
 			score := peer.GetQualityScore()

@@ -285,3 +285,43 @@ func TestRoutingTable_QualityBasedSelection(t *testing.T) {
 		t.Errorf("Expected low quality score for poor connection, got %d", route.Quality)
 	}
 }
+
+func TestRoutingTable_LocalConnectionPriority(t *testing.T) {
+	rt := NewRoutingTable(3)
+	
+	// Create a peer with local connection (highest priority)
+	localPeer := p2p.NewPeerInfo(net.ParseIP("10.0.0.2"))
+	localPeer.SetConnected(true)
+	localPeer.SetLocalConnection(true) // Local network connection
+	localPeer.UpdateLatency(5 * time.Millisecond)
+	
+	// Create a peer with public connection
+	publicPeer := p2p.NewPeerInfo(net.ParseIP("10.0.0.3"))
+	publicPeer.SetConnected(true)
+	publicPeer.SetLocalConnection(false) // Public NAT traversal
+	publicPeer.UpdateLatency(5 * time.Millisecond)
+	
+	rt.AddPeer(localPeer)
+	rt.AddPeer(publicPeer)
+	
+	localRoute := rt.GetRoute(localPeer.TunnelIP)
+	publicRoute := rt.GetRoute(publicPeer.TunnelIP)
+	
+	if localRoute == nil || publicRoute == nil {
+		t.Fatal("Routes not found")
+	}
+	
+	// Local connection should have higher quality score
+	if localRoute.Quality <= publicRoute.Quality {
+		t.Errorf("Local connection should have higher quality score. Local: %d, Public: %d",
+			localRoute.Quality, publicRoute.Quality)
+	}
+	
+	// Both should be direct routes
+	if localRoute.Type != RouteDirect {
+		t.Errorf("Expected local route to be direct, got %d", localRoute.Type)
+	}
+	if publicRoute.Type != RouteDirect {
+		t.Errorf("Expected public route to be direct, got %d", publicRoute.Type)
+	}
+}
