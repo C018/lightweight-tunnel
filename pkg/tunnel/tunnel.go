@@ -299,23 +299,27 @@ func (t *Tunnel) addClient(client *ClientConnection, ip net.IP) {
 
 // removeClient removes a client from the routing table
 func (t *Tunnel) removeClient(client *ClientConnection) {
+	var clientIP net.IP
+	
 	t.clientsMux.Lock()
-	defer t.clientsMux.Unlock()
-
 	if client.clientIP != nil {
-		ipStr := client.clientIP.String()
+		clientIP = client.clientIP
+		ipStr := clientIP.String()
 		delete(t.clients, ipStr)
 		log.Printf("Client unregistered: %s (remaining clients: %d)", ipStr, len(t.clients))
-		
-		// Also remove from routing table if mesh routing enabled
+	}
+	t.clientsMux.Unlock()
+	
+	if clientIP != nil {
+		// Remove from routing table if mesh routing enabled (outside of lock)
 		if t.routingTable != nil {
-			t.routingTable.RemovePeer(client.clientIP)
-			log.Printf("Removed peer %s from routing table", ipStr)
+			t.routingTable.RemovePeer(clientIP)
+			log.Printf("Removed peer %s from routing table", clientIP)
 		}
 		
-		// Broadcast peer disconnection to other clients
+		// Broadcast peer disconnection to other clients (acquires its own lock)
 		if t.config.P2PEnabled {
-			t.broadcastPeerDisconnect(client.clientIP)
+			t.broadcastPeerDisconnect(clientIP)
 		}
 	}
 }
@@ -337,8 +341,10 @@ func (t *Tunnel) broadcastPeerDisconnect(disconnectedIP net.IP) {
 		return
 	}
 	
-	// Broadcast to all clients
-	// Note: clientsMux is already held by caller
+	// Broadcast to all clients with its own lock
+	t.clientsMux.RLock()
+	defer t.clientsMux.RUnlock()
+	
 	for _, client := range t.clients {
 		if client.clientIP != nil && !client.clientIP.Equal(disconnectedIP) {
 			if err := client.conn.WritePacket(encryptedPacket); err != nil {
