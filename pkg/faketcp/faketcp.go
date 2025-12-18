@@ -26,6 +26,9 @@ const (
 	MaxPacketSize = 1500
 	// Maximum payload size (MTU - IP - TCP headers)
 	MaxPayloadSize = MaxPacketSize - IPHeaderSize - TCPHeaderSize
+	
+	// Read timeout duration for making blocking reads interruptible
+	ReadTimeoutDuration = 1 * time.Second
 )
 
 // TCPHeader represents a minimal TCP header
@@ -146,7 +149,7 @@ func (l *Listener) Accept() (*Conn, error) {
 	
 	for {
 		// Set read deadline to allow for interruption
-		l.udpConn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		l.udpConn.SetReadDeadline(time.Now().Add(ReadTimeoutDuration))
 		
 		n, remoteAddr, err := l.udpConn.ReadFromUDP(buf)
 		if err != nil {
@@ -200,11 +203,19 @@ func (l *Listener) Accept() (*Conn, error) {
 		if n > TCPHeaderSize {
 			payload := make([]byte, n-TCPHeaderSize)
 			copy(payload, buf[TCPHeaderSize:n])
-			select {
-			case conn.recvQueue <- payload:
-			default:
-				// Queue full, drop packet and log
-				log.Printf("WARNING: Receive queue full for %s, dropping packet (%d bytes)", connKey, len(payload))
+			
+			// Check if connection is closed before attempting to send
+			conn.mu.Lock()
+			closed := conn.closed
+			conn.mu.Unlock()
+			
+			if !closed {
+				select {
+				case conn.recvQueue <- payload:
+				default:
+					// Queue full, drop packet and log
+					log.Printf("WARNING: Receive queue full for %s, dropping packet (%d bytes)", connKey, len(payload))
+				}
 			}
 		}
 	}
@@ -260,14 +271,7 @@ func (c *Conn) WritePacket(data []byte) error {
 // ReadPacket receives data and strips fake TCP header
 func (c *Conn) ReadPacket() ([]byte, error) {
 	if !c.isConnected {
-		// Listener connection - read from queue
-		c.mu.Lock()
-		if c.closed {
-			c.mu.Unlock()
-			return nil, fmt.Errorf("connection closed")
-		}
-		c.mu.Unlock()
-		
+		// Listener connection - read from queue with proper closed check
 		select {
 		case payload, ok := <-c.recvQueue:
 			if !ok {
@@ -275,12 +279,19 @@ func (c *Conn) ReadPacket() ([]byte, error) {
 			}
 			return payload, nil
 		case <-time.After(30 * time.Second):
+			// Check if closed during timeout
+			c.mu.Lock()
+			closed := c.closed
+			c.mu.Unlock()
+			if closed {
+				return nil, fmt.Errorf("connection closed")
+			}
 			return nil, fmt.Errorf("read timeout")
 		}
 	}
 	
 	// Connected socket - read directly with deadline to allow interruption
-	c.udpConn.SetReadDeadline(time.Now().Add(1 * time.Second))
+	c.udpConn.SetReadDeadline(time.Now().Add(ReadTimeoutDuration))
 	
 	buf := make([]byte, MaxPacketSize)
 	n, err := c.udpConn.Read(buf)
