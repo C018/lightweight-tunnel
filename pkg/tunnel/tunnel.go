@@ -208,12 +208,16 @@ func (t *Tunnel) Start() error {
 
 // Stop stops the tunnel
 func (t *Tunnel) Stop() {
-	// Signal all goroutines to stop
-	close(t.stopCh)
-	
-	// Stop P2P manager
+	// Stop P2P manager first
 	if t.p2pManager != nil {
 		t.p2pManager.Stop()
+	}
+	
+	// Close TUN device FIRST - this will unblock Read/Write operations
+	if t.tunFile != nil {
+		if err := t.tunFile.Close(); err != nil {
+			log.Printf("Error closing TUN device: %v", err)
+		}
 	}
 	
 	// Close listener (server mode) - this will unblock Accept()
@@ -230,13 +234,6 @@ func (t *Tunnel) Stop() {
 		}
 	}
 	
-	// Close TUN device - this will unblock Read/Write operations
-	if t.tunFile != nil {
-		if err := t.tunFile.Close(); err != nil {
-			log.Printf("Error closing TUN device: %v", err)
-		}
-	}
-	
 	// Close all client connections (server mode)
 	t.clientsMux.Lock()
 	for _, client := range t.clients {
@@ -248,6 +245,9 @@ func (t *Tunnel) Stop() {
 		}
 	}
 	t.clientsMux.Unlock()
+	
+	// THEN signal all goroutines to stop
+	close(t.stopCh)
 	
 	// Now wait for all goroutines to finish
 	t.wg.Wait()
