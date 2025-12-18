@@ -270,9 +270,11 @@ func (t *Tunnel) addClient(client *ClientConnection, ip net.IP) {
 	if existing, ok := t.clients[ipStr]; ok {
 		log.Printf("Warning: IP conflict detected for %s, closing old connection", ipStr)
 		existing.stopOnce.Do(func() {
+			// Close connection first to unblock I/O
+			existing.conn.Close()
+			// Then signal goroutines to stop
 			close(existing.stopCh)
 		})
-		existing.conn.Close()
 	}
 
 	client.clientIP = ip
