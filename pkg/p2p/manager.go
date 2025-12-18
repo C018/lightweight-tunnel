@@ -161,6 +161,8 @@ func (m *Manager) ConnectToPeer(peerTunnelIP net.IP) error {
 			localConn := &Connection{
 				RemoteAddr: localAddr,
 				PeerIP:     peerTunnelIP,
+				sendQueue:  make(chan []byte, 100),
+				stopCh:     make(chan struct{}),
 			}
 			go m.performHandshake(localConn)
 			log.Printf("Attempting P2P connection to %s at public=%s and local=%s", ipStr, peer.PublicAddr, peer.LocalAddr)

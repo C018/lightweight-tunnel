@@ -1032,17 +1032,19 @@ func (t *Tunnel) handlePeerInfoPacket(fromIP net.IP, data []byte) {
 	peer.PublicAddr = parts[1]
 	peer.LocalAddr = parts[2]
 	
-	// Add to P2P manager
+	// Add to P2P manager first
 	if t.p2pManager != nil {
 		t.p2pManager.AddPeer(peer)
-		
-		// Try to establish P2P connection
-		go t.p2pManager.ConnectToPeer(tunnelIP)
 	}
 	
 	// Add to routing table
 	if t.routingTable != nil {
 		t.routingTable.AddPeer(peer)
+	}
+	
+	// Try to establish P2P connection (after peer is added)
+	if t.p2pManager != nil {
+		go t.p2pManager.ConnectToPeer(tunnelIP)
 	}
 	
 	log.Printf("Received peer info: %s at %s", tunnelIP, peer.PublicAddr)
@@ -1072,17 +1074,19 @@ func (t *Tunnel) handlePeerInfoFromServer(data []byte) {
 	peer.PublicAddr = parts[1]
 	peer.LocalAddr = parts[2]
 	
-	// Add to P2P manager
+	// Add to P2P manager first
 	if t.p2pManager != nil {
 		t.p2pManager.AddPeer(peer)
-		
-		// Try to establish P2P connection
-		go t.p2pManager.ConnectToPeer(tunnelIP)
 	}
 	
 	// Add to routing table
 	if t.routingTable != nil {
 		t.routingTable.AddPeer(peer)
+	}
+	
+	// Try to establish P2P connection (after peer is added)
+	if t.p2pManager != nil {
+		go t.p2pManager.ConnectToPeer(tunnelIP)
 	}
 	
 	log.Printf("Received peer info from server: %s at %s (local: %s)", tunnelIP, peer.PublicAddr, peer.LocalAddr)
