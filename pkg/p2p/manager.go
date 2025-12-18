@@ -15,17 +15,20 @@ const (
 	HandshakeInterval = 200 * time.Millisecond
 	// ReadTimeout is the timeout for UDP read operations
 	ReadTimeout = 1 * time.Second
+	// LocalConnectionTimeout is the timeout to wait for local connection before trying public
+	LocalConnectionTimeout = 2 * time.Second
 )
 
 // Connection represents a P2P UDP connection to a peer
 type Connection struct {
-	LocalAddr  *net.UDPAddr
-	RemoteAddr *net.UDPAddr
-	Conn       *net.UDPConn
-	PeerIP     net.IP // Tunnel IP of the peer
-	sendQueue  chan []byte
-	stopCh     chan struct{}
-	wg         sync.WaitGroup
+	LocalAddr       *net.UDPAddr
+	RemoteAddr      *net.UDPAddr
+	Conn            *net.UDPConn
+	PeerIP          net.IP // Tunnel IP of the peer
+	IsLocalNetwork  bool   // Whether this connection is via local network
+	sendQueue       chan []byte
+	stopCh          chan struct{}
+	wg              sync.WaitGroup
 }
 
 // Manager manages P2P connections
@@ -118,6 +121,7 @@ func (m *Manager) AddPeer(peer *PeerInfo) {
 }
 
 // ConnectToPeer establishes a P2P connection to a peer
+// Priority order: 1) Local network address, 2) Public address, 3) Server fallback
 func (m *Manager) ConnectToPeer(peerTunnelIP net.IP) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -140,55 +144,120 @@ func (m *Manager) ConnectToPeer(peerTunnelIP net.IP) error {
 		return fmt.Errorf("peer %s not found", ipStr)
 	}
 	
-	// Try to parse peer's public address
+	// Priority: Try local address first (internal network direct connection)
+	// Only fall back to public address if local fails
+	hasLocalAddr := peer.LocalAddr != "" && peer.LocalAddr != peer.PublicAddr
+	
+	if hasLocalAddr {
+		localAddr, err := net.ResolveUDPAddr("udp4", peer.LocalAddr)
+		if err == nil {
+			// Create connection object with local address (highest priority)
+			conn := &Connection{
+				RemoteAddr:     localAddr,
+				PeerIP:         peerTunnelIP,
+				IsLocalNetwork: true,
+				sendQueue:      make(chan []byte, 100),
+				stopCh:         make(chan struct{}),
+			}
+			m.connections[ipStr] = conn
+			
+			log.Printf("Attempting P2P connection to %s via LOCAL address first: %s (public: %s)", 
+				ipStr, peer.LocalAddr, peer.PublicAddr)
+			
+			// Start local handshake first
+			go m.performHandshakeWithFallback(conn, peer)
+			return nil
+		}
+	}
+	
+	// No local address available, try public address directly
 	remoteAddr, err := net.ResolveUDPAddr("udp4", peer.PublicAddr)
 	if err != nil {
 		return fmt.Errorf("failed to resolve peer public address: %v", err)
 	}
 	
-	// Create or update connection with public address
-	conn, connExists := m.connections[ipStr]
-	if !connExists {
-		conn = &Connection{
-			RemoteAddr: remoteAddr,
-			PeerIP:     peerTunnelIP,
-			sendQueue:  make(chan []byte, 100),
-			stopCh:     make(chan struct{}),
-		}
-		m.connections[ipStr] = conn
-	} else {
-		// Update remote address for retry
-		conn.RemoteAddr = remoteAddr
+	// Create connection with public address
+	conn := &Connection{
+		RemoteAddr:     remoteAddr,
+		PeerIP:         peerTunnelIP,
+		IsLocalNetwork: false,
+		sendQueue:      make(chan []byte, 100),
+		stopCh:         make(chan struct{}),
 	}
+	m.connections[ipStr] = conn
 	
-	// Send initial handshake packet for NAT traversal to public address
-	go m.performHandshake(conn)
+	log.Printf("Attempting P2P connection to %s at public address: %s", ipStr, peer.PublicAddr)
 	
-	// Also try local address if different from public (for same-network peers)
-	if peer.LocalAddr != "" && peer.LocalAddr != peer.PublicAddr {
-		localAddr, err := net.ResolveUDPAddr("udp4", peer.LocalAddr)
-		if err == nil {
-			// Create a temporary connection object for local address handshake
-			localConn := &Connection{
-				RemoteAddr: localAddr,
-				PeerIP:     peerTunnelIP,
-				sendQueue:  make(chan []byte, 100),
-				stopCh:     make(chan struct{}),
-			}
-			go m.performHandshake(localConn)
-			log.Printf("Attempting P2P connection to %s at public=%s and local=%s", ipStr, peer.PublicAddr, peer.LocalAddr)
-		} else {
-			log.Printf("Attempting P2P connection to %s at %s", ipStr, peer.PublicAddr)
-		}
-	} else {
-		log.Printf("Attempting P2P connection to %s at %s", ipStr, peer.PublicAddr)
-	}
+	// Perform handshake to public address
+	go m.performHandshake(conn, false)
 	
 	return nil
 }
 
+// performHandshakeWithFallback tries local address first, then falls back to public address
+func (m *Manager) performHandshakeWithFallback(conn *Connection, peer *PeerInfo) {
+	ipStr := conn.PeerIP.String()
+	
+	// First: Try local address with timeout
+	log.Printf("P2P: Trying local address %s for peer %s", conn.RemoteAddr, ipStr)
+	
+	localSuccess := m.tryHandshakeWithTimeout(conn, LocalConnectionTimeout)
+	
+	if localSuccess {
+		log.Printf("P2P: Local connection SUCCEEDED to %s via %s", ipStr, conn.RemoteAddr)
+		return
+	}
+	
+	log.Printf("P2P: Local connection to %s failed, falling back to public address %s", 
+		ipStr, peer.PublicAddr)
+	
+	// Fallback: Try public address
+	publicAddr, err := net.ResolveUDPAddr("udp4", peer.PublicAddr)
+	if err != nil {
+		log.Printf("P2P: Failed to resolve public address %s: %v", peer.PublicAddr, err)
+		return
+	}
+	
+	// Update connection to use public address
+	m.mu.Lock()
+	conn.RemoteAddr = publicAddr
+	conn.IsLocalNetwork = false
+	m.mu.Unlock()
+	
+	// Perform handshake to public address
+	m.performHandshake(conn, false)
+}
+
+// tryHandshakeWithTimeout attempts handshake with a specific timeout
+// Returns true if peer responds (connection established)
+func (m *Manager) tryHandshakeWithTimeout(conn *Connection, timeout time.Duration) bool {
+	handshakeMsg := []byte("P2P_HANDSHAKE")
+	deadline := time.Now().Add(timeout)
+	
+	// Send handshake packets until timeout or success
+	for time.Now().Before(deadline) {
+		_, err := m.listener.WriteToUDP(handshakeMsg, conn.RemoteAddr)
+		if err != nil {
+			log.Printf("Handshake send error to %s: %v", conn.PeerIP, err)
+		}
+		
+		// Check if peer responded (connection marked as connected)
+		m.mu.RLock()
+		connected := m.isPeerConnected(conn.PeerIP.String())
+		m.mu.RUnlock()
+		
+		if connected {
+			return true
+		}
+		
+		time.Sleep(HandshakeInterval)
+	}
+	
+	return false
+}
+
 // performHandshake performs NAT hole punching handshake
-func (m *Manager) performHandshake(conn *Connection) {
+func (m *Manager) performHandshake(conn *Connection, isLocal bool) {
 	// Send multiple handshake packets to establish NAT mapping
 	handshakeMsg := []byte("P2P_HANDSHAKE")
 	
@@ -279,15 +348,32 @@ func (m *Manager) handleHandshake(remoteAddr *net.UDPAddr) {
 	peerIP := m.findPeerByAddr(remoteAddr)
 	if peerIP != nil {
 		m.mu.Lock()
+		ipStr := peerIP.String()
+		
+		// Check if this is a local address connection
+		isLocalConnection := false
+		if peer, exists := m.peers[ipStr]; exists {
+			// Compare the address that responded with peer's local address
+			if peer.LocalAddr == remoteAddr.String() {
+				isLocalConnection = true
+			}
+		}
+		
 		// Update connection's remote address to the one that actually worked
-		if conn, exists := m.connections[peerIP.String()]; exists {
+		if conn, exists := m.connections[ipStr]; exists {
 			// Update to the address that successfully sent us a packet
 			conn.RemoteAddr = remoteAddr
+			conn.IsLocalNetwork = isLocalConnection
 		}
-		// Mark peer as connected
-		if peer, exists := m.peers[peerIP.String()]; exists {
+		// Mark peer as connected and track connection type
+		if peer, exists := m.peers[ipStr]; exists {
 			peer.SetConnected(true)
-			log.Printf("P2P connection established with %s via %s", peerIP, remoteAddr)
+			peer.SetLocalConnection(isLocalConnection)
+			if isLocalConnection {
+				log.Printf("P2P LOCAL connection established with %s via %s", peerIP, remoteAddr)
+			} else {
+				log.Printf("P2P PUBLIC connection established with %s via %s", peerIP, remoteAddr)
+			}
 		}
 		m.mu.Unlock()
 		
@@ -367,4 +453,31 @@ func (m *Manager) IsConnected(peerIP net.IP) bool {
 	
 	// Check if peer is marked as connected (handshake complete)
 	return m.isPeerConnected(ipStr)
+}
+
+// RemovePeer removes a peer from the P2P manager
+func (m *Manager) RemovePeer(peerIP net.IP) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	
+	ipStr := peerIP.String()
+	
+	// Close connection if exists
+	if conn, exists := m.connections[ipStr]; exists {
+		// Stop connection goroutines
+		select {
+		case <-conn.stopCh:
+			// Already closed
+		default:
+			close(conn.stopCh)
+		}
+		delete(m.connections, ipStr)
+		log.Printf("P2P connection to %s removed", ipStr)
+	}
+	
+	// Remove peer info
+	if _, exists := m.peers[ipStr]; exists {
+		delete(m.peers, ipStr)
+		log.Printf("P2P peer %s removed", ipStr)
+	}
 }

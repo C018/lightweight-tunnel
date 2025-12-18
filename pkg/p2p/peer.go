@@ -16,6 +16,7 @@ type PeerInfo struct {
 	PacketLoss   float64   // Packet loss rate (0.0 - 1.0)
 	Connected    bool      // Whether P2P connection is established
 	ThroughServer bool     // Whether currently routing through server
+	IsLocalConnection bool // Whether connection is via local network (not NAT)
 	RelayPeers   []net.IP  // List of peers that can relay to this peer
 	mu           sync.RWMutex
 }
@@ -54,6 +55,13 @@ func (p *PeerInfo) SetConnected(connected bool) {
 	}
 }
 
+// SetLocalConnection marks whether the connection is via local network
+func (p *PeerInfo) SetLocalConnection(isLocal bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.IsLocalConnection = isLocal
+}
+
 // SetThroughServer marks traffic as going through server
 func (p *PeerInfo) SetThroughServer(through bool) {
 	p.mu.Lock()
@@ -83,10 +91,11 @@ func (p *PeerInfo) GetQualityScore() int {
 	
 	// Quality scoring constants
 	const (
-		latencyPenaltyDivisor   = 10    // Divide latency by this to get penalty groups
+		latencyPenaltyDivisor    = 10    // Divide latency by this to get penalty groups
 		latencyPenaltyMultiplier = 5     // Multiply penalty groups by this value
 		packetLossPenaltyScale   = 1000  // Scale packet loss to penalty points
 		p2pQualityBonus          = 20    // Bonus points for P2P connection
+		localConnectionBonus     = 30    // Bonus points for local network connection (highest priority)
 		serverRoutePenalty       = 30    // Penalty points for server routing
 	)
 	
@@ -106,17 +115,24 @@ func (p *PeerInfo) GetQualityScore() int {
 		score += p2pQualityBonus
 	}
 	
+	// Extra bonus for local network connection (highest priority)
+	// This ensures local connections are preferred over public NAT traversal
+	if p.IsLocalConnection {
+		score += localConnectionBonus
+	}
+	
 	// Penalty for going through server
 	if p.ThroughServer {
 		score -= serverRoutePenalty
 	}
 	
 	// Ensure score is in valid range
+	// Allow scores above 100 for local connection bonus to ensure proper prioritization
 	if score < 0 {
 		score = 0
 	}
-	if score > 100 {
-		score = 100
+	if score > 150 {
+		score = 150
 	}
 	
 	return score
@@ -135,15 +151,16 @@ func (p *PeerInfo) Clone() *PeerInfo {
 	defer p.mu.RUnlock()
 	
 	clone := &PeerInfo{
-		TunnelIP:      p.TunnelIP,
-		PublicAddr:    p.PublicAddr,
-		LocalAddr:     p.LocalAddr,
-		LastSeen:      p.LastSeen,
-		Latency:       p.Latency,
-		PacketLoss:    p.PacketLoss,
-		Connected:     p.Connected,
-		ThroughServer: p.ThroughServer,
-		RelayPeers:    make([]net.IP, len(p.RelayPeers)),
+		TunnelIP:          p.TunnelIP,
+		PublicAddr:        p.PublicAddr,
+		LocalAddr:         p.LocalAddr,
+		LastSeen:          p.LastSeen,
+		Latency:           p.Latency,
+		PacketLoss:        p.PacketLoss,
+		Connected:         p.Connected,
+		ThroughServer:     p.ThroughServer,
+		IsLocalConnection: p.IsLocalConnection,
+		RelayPeers:        make([]net.IP, len(p.RelayPeers)),
 	}
 	copy(clone.RelayPeers, p.RelayPeers)
 	
