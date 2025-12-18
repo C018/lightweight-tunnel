@@ -54,6 +54,7 @@ type Tunnel struct {
 	tunName    string
 	tunFile    *TunDevice
 	stopCh     chan struct{}
+	stopOnce   sync.Once // Ensures Stop() is only executed once
 	wg         sync.WaitGroup
 	sendQueue  chan []byte  // Used in client mode
 	recvQueue  chan []byte  // Used in client mode
@@ -208,52 +209,56 @@ func (t *Tunnel) Start() error {
 
 // Stop stops the tunnel
 func (t *Tunnel) Stop() {
-	// Close TUN device FIRST - this will unblock Read/Write operations
-	if t.tunFile != nil {
-		if err := t.tunFile.Close(); err != nil {
-			log.Printf("Error closing TUN device: %v", err)
+	// Use sync.Once to ensure Stop() logic only runs once
+	t.stopOnce.Do(func() {
+		// Close TUN device FIRST - this will unblock Read/Write operations
+		if t.tunFile != nil {
+			if err := t.tunFile.Close(); err != nil {
+				log.Printf("Error closing TUN device: %v", err)
+			}
 		}
-	}
-	
-	// Close listener (server mode) - this will unblock Accept()
-	if t.listener != nil {
-		if err := t.listener.Close(); err != nil {
-			log.Printf("Error closing listener: %v", err)
+		
+		// Close listener (server mode) - this will unblock Accept()
+		if t.listener != nil {
+			if err := t.listener.Close(); err != nil {
+				log.Printf("Error closing listener: %v", err)
+			}
 		}
-	}
-	
-	// Close single connection (client mode) - this will unblock Read/Write
-	if t.conn != nil {
-		if err := t.conn.Close(); err != nil {
-			log.Printf("Error closing connection: %v", err)
+		
+		// Close single connection (client mode) - this will unblock Read/Write
+		if t.conn != nil {
+			if err := t.conn.Close(); err != nil {
+				log.Printf("Error closing connection: %v", err)
+			}
 		}
-	}
-	
-	// Close all client connections and signal client goroutines (server mode)
-	t.clientsMux.Lock()
-	for _, client := range t.clients {
-		// Close connection first
-		if err := client.conn.Close(); err != nil {
-			log.Printf("Error closing client connection: %v", err)
+		
+		// Close all client connections and signal client goroutines (server mode)
+		t.clientsMux.Lock()
+		for _, client := range t.clients {
+			// Use stopOnce to safely close both connection and channel
+			client.stopOnce.Do(func() {
+				// Close connection first
+				if err := client.conn.Close(); err != nil {
+					log.Printf("Error closing client connection: %v", err)
+				}
+				// Then signal client goroutines to stop
+				close(client.stopCh)
+			})
 		}
-		// Then signal client goroutines to stop
-		client.stopOnce.Do(func() {
-			close(client.stopCh)
-		})
-	}
-	t.clientsMux.Unlock()
-	
-	// Signal all tunnel goroutines to stop
-	close(t.stopCh)
-	
-	// Stop P2P manager
-	if t.p2pManager != nil {
-		t.p2pManager.Stop()
-	}
-	
-	// Now wait for all goroutines to finish
-	t.wg.Wait()
-	log.Println("Tunnel stopped")
+		t.clientsMux.Unlock()
+		
+		// Signal all tunnel goroutines to stop
+		close(t.stopCh)
+		
+		// Stop P2P manager
+		if t.p2pManager != nil {
+			t.p2pManager.Stop()
+		}
+		
+		// Now wait for all goroutines to finish
+		t.wg.Wait()
+		log.Println("Tunnel stopped")
+	})
 }
 
 // addClient adds a client to the routing table
