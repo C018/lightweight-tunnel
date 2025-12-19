@@ -455,7 +455,7 @@ func (c *RawConn) receiver() {
 }
 
 // receiverListener receives packets (for listener connections)
-func (c *RawConn) receiverListener(fd int, l *RawListener) {
+func (c *RawConn) receiverListener(fd int, _ *RawListener) {
 	buf := make([]byte, RawMaxPacketSize)
 	for {
 		if atomic.LoadInt32(&c.closed) != 0 {
