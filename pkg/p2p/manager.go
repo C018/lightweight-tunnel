@@ -29,6 +29,12 @@ const (
 	KeepaliveInterval = 15 * time.Second
 	// ConnectionStaleTimeout is the timeout after which a connection is considered stale
 	ConnectionStaleTimeout = 60 * time.Second
+	// QualityCheckPoorThreshold is the quality score below which a connection is considered poor
+	QualityCheckPoorThreshold = 50
+	// QualityCheckCriticalThreshold is the quality score below which fallback to server is considered
+	QualityCheckCriticalThreshold = 30
+	// PortPredictionRange is the range of ports to try around known port for symmetric NAT
+	PortPredictionRange = 20
 )
 
 // Connection represents a P2P UDP connection to a peer
@@ -768,12 +774,31 @@ func (m *Manager) connectWithPortPrediction(peer *PeerInfo, peerTunnelIP net.IP)
 	
 	// Try a range of ports around the known port
 	// Symmetric NATs often allocate ports sequentially
-	const portRange = 20 // Try +/- 20 ports
 	
-	var connections []*Connection
+	// Create the primary connection with the known port
+	primaryConn := &Connection{
+		RemoteAddr:         publicAddr,
+		PeerIP:             peerTunnelIP,
+		IsLocalNetwork:     false,
+		sendQueue:          make(chan []byte, 100),
+		stopCh:             make(chan struct{}),
+		handshakeStartTime: time.Now(),
+		lastHandshakeTime:  time.Now(),
+	}
 	
-	// Create multiple connection attempts with predicted ports
-	for offset := -portRange; offset <= portRange; offset++ {
+	// Store the primary connection
+	m.connections[ipStr] = primaryConn
+	
+	// Start handshake to primary port
+	go m.performHandshake(primaryConn, false)
+	
+	// Also try predicted ports (but don't store connections to avoid leaks)
+	// These are best-effort attempts that share the stop channel with primary
+	for offset := -PortPredictionRange; offset <= PortPredictionRange; offset++ {
+		if offset == 0 {
+			continue // Already handled as primary
+		}
+		
 		predictedPort := basePort + offset
 		if predictedPort < 1024 || predictedPort > 65535 {
 			continue // Skip invalid ports
@@ -784,30 +809,23 @@ func (m *Manager) connectWithPortPrediction(peer *PeerInfo, peerTunnelIP net.IP)
 			Port: predictedPort,
 		}
 		
-		conn := &Connection{
+		// Create temporary connection for prediction attempt
+		// Use primary connection's stop channel so it stops when primary succeeds
+		tempConn := &Connection{
 			RemoteAddr:         predictedAddr,
 			PeerIP:             peerTunnelIP,
 			IsLocalNetwork:     false,
 			sendQueue:          make(chan []byte, 100),
-			stopCh:             make(chan struct{}),
+			stopCh:             primaryConn.stopCh, // Share stop channel
 			handshakeStartTime: time.Now(),
 			lastHandshakeTime:  time.Now(),
 		}
 		
-		connections = append(connections, conn)
+		// Start handshake to predicted port (will stop when primary succeeds)
+		go m.performHandshake(tempConn, false)
 	}
 	
-	// Store the primary connection (base port)
-	if len(connections) > portRange {
-		m.connections[ipStr] = connections[portRange] // Middle one is base port
-	}
-	
-	// Start handshake to all predicted ports simultaneously
-	log.Printf("Starting simultaneous handshake to %d predicted ports for %s", len(connections), ipStr)
-	for _, conn := range connections {
-		go m.performHandshake(conn, false)
-	}
-	
+	log.Printf("Started port prediction handshake for %s (trying %d ports)", ipStr, PortPredictionRange*2)
 	return nil
 }
 
@@ -937,12 +955,12 @@ func (m *Manager) checkConnectionQuality() {
 		quality := peer.GetQualityScore()
 		
 		// Log poor quality connections
-		if quality < 50 {
+		if quality < QualityCheckPoorThreshold {
 			log.Printf("⚠️  Poor P2P connection quality to %s: score=%d, latency=%v, loss=%.2f%%, last_seen=%v ago",
 				ipStr, quality, rtt, loss*100, timeSinceLastSeen)
 			
 			// If quality is very poor and connection is stale, consider switching to server relay
-			if quality < 30 && timeSinceLastSeen > ConnectionStaleTimeout/2 {
+			if quality < QualityCheckCriticalThreshold && timeSinceLastSeen > ConnectionStaleTimeout/2 {
 				log.Printf("Connection to %s is poor quality - may need to fallback to server relay", ipStr)
 				// Mark as going through server temporarily
 				peer.SetThroughServer(true)

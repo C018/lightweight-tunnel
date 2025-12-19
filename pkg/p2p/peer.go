@@ -158,7 +158,11 @@ func (p *PeerInfo) AddRelayPeer(relayIP net.IP) {
 	p.RelayPeers = append(p.RelayPeers, relayIP)
 }
 
-// GetQualityScore returns a quality score for this peer (0-100, higher is better)
+// GetQualityScore returns a quality score for this peer (0-150, higher is better)
+// Score above 100 indicates excellent quality (typically local connections)
+// Score 80-100 is good quality P2P
+// Score 50-80 is acceptable
+// Score below 50 indicates poor quality that may need attention
 func (p *PeerInfo) GetQualityScore() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
