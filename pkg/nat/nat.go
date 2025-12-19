@@ -89,10 +89,10 @@ func (n NATType) CanTraverseWith(other NATType) bool {
 }
 
 // ShouldInitiateConnection determines if this NAT should initiate connection to the other
-// Higher-level (worse) NAT should initiate connections to lower-level (better) NAT
+// Prefer better (lower level) NAT to initiate, improving success rate and reducing latency
 func (n NATType) ShouldInitiateConnection(other NATType) bool {
-	// If we have a worse NAT (higher level), we should initiate
-	return n.GetLevel() > other.GetLevel()
+	// Prefer the side with better NAT characteristics to initiate to reduce latency and failures
+	return n.GetLevel() < other.GetLevel()
 }
 
 // Detector handles NAT type detection
@@ -127,7 +127,7 @@ func (d *Detector) DetectNATType(serverAddr string) (NATType, error) {
 	// Step 2: Test for symmetric NAT by checking if port changes per destination
 	// This requires connecting to multiple servers, which we'll simplify
 	// For now, we'll use a heuristic based on socket binding behavior
-	
+
 	// Create two UDP connections to different destinations
 	isSymmetric, err := d.testSymmetricNAT(serverAddr)
 	if err != nil {
@@ -221,7 +221,7 @@ func bytesInRange(ip, start, end net.IP) bool {
 func (d *Detector) testSymmetricNAT(serverAddr string) (bool, error) {
 	// For a simplified test, we'll check if we can reuse the same local port
 	// Symmetric NATs typically allocate different ports for different destinations
-	
+
 	// Create first connection
 	conn1, err := net.Dial("udp4", serverAddr)
 	if err != nil {
