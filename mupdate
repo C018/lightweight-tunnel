@@ -9,8 +9,13 @@ if [ ! -d "$REPO_DIR/.git" ]; then
   exit 1
 fi
 
+if [ -n "$(git status --porcelain)" ]; then
+  echo "Working tree has local changes. Please commit or stash them before running mupdate."
+  exit 1
+fi
+
 echo "Pulling latest changes..."
-if ! git pull; then
+if ! git pull --ff-only; then
   echo "git pull failed. Please ensure the repository is clean, resolve any merge conflicts, and verify network connectivity before rerunning this script."
   exit 1
 fi
@@ -39,6 +44,10 @@ else
   exit 1
 fi
 
-echo "Installing binary to $TARGET (may prompt for sudo)..."
+if [[ "$INSTALLER" == sudo* ]]; then
+  echo "Installing binary to $TARGET (may prompt for sudo)..."
+else
+  echo "Installing binary to $TARGET..."
+fi
 $INSTALLER "$BIN_PATH" "$TARGET"
 echo "Update completed."
