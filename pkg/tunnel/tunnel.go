@@ -81,22 +81,24 @@ type clientRoute struct {
 
 // Tunnel represents a lightweight tunnel
 type Tunnel struct {
-	config     *config.Config
-	fec        *fec.FEC
-	cipher     *crypto.Cipher // Encryption cipher (nil if no key)
-	cipherMux  sync.RWMutex
-	configMux  sync.RWMutex
-	conn       faketcp.ConnAdapter          // Used in client mode (interface for both modes)
-	listener   faketcp.ListenerAdapter      // Used in server mode (interface for both modes)
-	clients    map[string]*ClientConnection // Used in server mode (key: IP address)
-	clientsMux sync.RWMutex
-	tunName    string
-	tunFile    *TunDevice
-	stopCh     chan struct{}
-	stopOnce   sync.Once // Ensures Stop() is only executed once
-	wg         sync.WaitGroup
-	sendQueue  chan []byte // Used in client mode
-	recvQueue  chan []byte // Used in client mode
+	config        *config.Config
+	fec           *fec.FEC
+	cipher        *crypto.Cipher // Encryption cipher (nil if no key)
+	cipherMux     sync.RWMutex
+	configMux     sync.RWMutex
+	conn          faketcp.ConnAdapter          // Used in client mode (interface for both modes)
+	listener      faketcp.ListenerAdapter      // Used in server mode (interface for both modes)
+	clients       map[string]*ClientConnection // Used in server mode (key: IP address)
+	clientsMux    sync.RWMutex
+	allClients    map[*ClientConnection]struct{} // Tracks all active clients (including those without registered tunnel IP)
+	allClientsMux sync.RWMutex
+	tunName       string
+	tunFile       *TunDevice
+	stopCh        chan struct{}
+	stopOnce      sync.Once // Ensures Stop() is only executed once
+	wg            sync.WaitGroup
+	sendQueue     chan []byte // Used in client mode
+	recvQueue     chan []byte // Used in client mode
 
 	// P2P and routing
 	p2pManager    *p2p.Manager          // P2P connection manager
@@ -203,6 +205,7 @@ func NewTunnel(cfg *config.Config) (*Tunnel, error) {
 		stopCh:       make(chan struct{}),
 		myTunnelIP:   myIP,
 		clientRoutes: make(map[*ClientConnection][]string),
+		allClients:   make(map[*ClientConnection]struct{}),
 	}
 
 	// Initialize P2P manager if enabled
@@ -377,6 +380,18 @@ func (t *Tunnel) Stop() {
 		}
 		t.clientsMux.Unlock()
 
+		// Also close any clients that haven't been registered with a tunnel IP yet
+		t.allClientsMux.RLock()
+		for client := range t.allClients {
+			client.stopOnce.Do(func() {
+				if err := client.conn.Close(); err != nil {
+					log.Printf("Error closing client connection: %v", err)
+				}
+				close(client.stopCh)
+			})
+		}
+		t.allClientsMux.RUnlock()
+
 		// Stop P2P manager
 		if t.p2pManager != nil {
 			t.p2pManager.Stop()
@@ -398,6 +413,18 @@ func (t *Tunnel) Stop() {
 			log.Println("Timeout waiting for tunnel goroutines to stop; continuing shutdown")
 		}
 	})
+}
+
+func (t *Tunnel) trackClientConnection(client *ClientConnection) {
+	t.allClientsMux.Lock()
+	t.allClients[client] = struct{}{}
+	t.allClientsMux.Unlock()
+}
+
+func (t *Tunnel) untrackClientConnection(client *ClientConnection) {
+	t.allClientsMux.Lock()
+	delete(t.allClients, client)
+	t.allClientsMux.Unlock()
 }
 
 // addClient adds a client to the routing table
@@ -712,6 +739,8 @@ func (t *Tunnel) handleClient(conn faketcp.ConnAdapter) {
 		stopCh:    make(chan struct{}),
 	}
 
+	t.trackClientConnection(client)
+
 	// Send client's public address for NAT traversal (if P2P enabled)
 	if t.config.P2PEnabled {
 		go t.sendPublicAddrToClient(client)
@@ -729,6 +758,7 @@ func (t *Tunnel) handleClient(conn faketcp.ConnAdapter) {
 	// Wait for client to disconnect
 	client.wg.Wait()
 
+	t.untrackClientConnection(client)
 	// Clean up client
 	t.removeClient(client)
 	log.Printf("Client disconnected: %s", conn.RemoteAddr())
@@ -2417,12 +2447,12 @@ func (t *Tunnel) pushConfigUpdate() error {
 	}
 
 	// Snapshot clients to avoid holding lock during network IO
-	t.clientsMux.RLock()
-	clients := make([]*ClientConnection, 0, len(t.clients))
-	for _, c := range t.clients {
+	t.allClientsMux.RLock()
+	clients := make([]*ClientConnection, 0, len(t.allClients))
+	for c := range t.allClients {
 		clients = append(clients, c)
 	}
-	t.clientsMux.RUnlock()
+	t.allClientsMux.RUnlock()
 
 	for _, client := range clients {
 		if client == nil {
