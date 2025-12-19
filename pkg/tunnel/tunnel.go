@@ -67,6 +67,7 @@ type ClientConnection struct {
 	// lastPeerInfo stores the last peer info string sent by this client
 	lastPeerInfo string
 	cipher       *crypto.Cipher
+	cipherGen    uint64
 	mu           sync.RWMutex
 }
 
@@ -81,16 +82,17 @@ type clientRoute struct {
 	client  *ClientConnection
 }
 
-func (c *ClientConnection) setCipher(cipher *crypto.Cipher) {
+func (c *ClientConnection) setCipherWithGen(cipher *crypto.Cipher, gen uint64) {
 	c.mu.Lock()
 	c.cipher = cipher
+	c.cipherGen = gen
 	c.mu.Unlock()
 }
 
-func (c *ClientConnection) getCipher() *crypto.Cipher {
+func (c *ClientConnection) getCipher() (*crypto.Cipher, uint64) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.cipher
+	return c.cipher, c.cipherGen
 }
 
 // Tunnel represents a lightweight tunnel
@@ -98,7 +100,9 @@ type Tunnel struct {
 	config        *config.Config
 	fec           *fec.FEC
 	cipher        *crypto.Cipher // Encryption cipher (nil if no key)
+	cipherGen     uint64
 	prevCipher    *crypto.Cipher
+	prevCipherGen uint64
 	prevCipherExp time.Time
 	cipherMux     sync.RWMutex
 	configMux     sync.RWMutex
@@ -222,6 +226,10 @@ func NewTunnel(cfg *config.Config) (*Tunnel, error) {
 		myTunnelIP:   myIP,
 		clientRoutes: make(map[*ClientConnection][]string),
 		allClients:   make(map[*ClientConnection]struct{}),
+	}
+
+	if cipher != nil {
+		t.cipherGen = 1
 	}
 
 	// Initialize P2P manager if enabled
@@ -1269,14 +1277,14 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 		}
 
 		// Decrypt if cipher is available (supports previous key during grace)
-		decryptedPacket, usedCipher, err := t.decryptPacketForServer(packet)
+		decryptedPacket, usedCipher, gen, err := t.decryptPacketForServer(packet)
 		if err != nil {
 			log.Printf("Client decryption error from %s (wrong key?): %v", client.conn.RemoteAddr(), err)
 			continue
 		}
 
 		if usedCipher != nil {
-			client.setCipher(usedCipher)
+			client.setCipherWithGen(usedCipher, gen)
 		}
 
 		if len(decryptedPacket) < 1 {
@@ -2235,56 +2243,64 @@ func (t *Tunnel) encryptPacket(data []byte) ([]byte, error) {
 	return c.Encrypt(data)
 }
 
-func (t *Tunnel) decryptWithFallback(data []byte) ([]byte, *crypto.Cipher, error) {
+func (t *Tunnel) decryptWithFallback(data []byte) ([]byte, *crypto.Cipher, uint64, error) {
 	t.cipherMux.RLock()
 	active := t.cipher
+	activeGen := t.cipherGen
 	prev := t.prevCipher
+	prevGen := t.prevCipherGen
 	exp := t.prevCipherExp
 	t.cipherMux.RUnlock()
 
 	var activeErr error
 	if active != nil {
 		if plain, err := active.Decrypt(data); err == nil {
-			if prev != nil {
+			if prev != nil && t.isPrevCipherActive(prev) {
 				t.deactivatePrevCipher(prev, "new key confirmed in use")
 			}
-			return plain, active, nil
+			return plain, active, activeGen, nil
 		} else {
 			activeErr = err
 		}
 	}
 
 	if prev != nil {
-		if time.Now().After(exp) {
+		if time.Now().After(exp) && t.isPrevCipherActive(prev) {
 			t.deactivatePrevCipher(prev, "grace period expired")
 		} else if plain, err := prev.Decrypt(data); err == nil {
-			return plain, prev, nil
+			return plain, prev, prevGen, nil
 		}
 	}
 
 	if activeErr != nil {
-		return nil, nil, activeErr
+		return nil, nil, 0, activeErr
 	}
-	return nil, nil, errors.New("decryption failed")
+	return nil, nil, 0, errors.New("decryption failed")
 }
 
 // decryptPacket decrypts a packet if cipher is available
 func (t *Tunnel) decryptPacket(data []byte) ([]byte, error) {
-	plain, _, err := t.decryptWithFallback(data)
+	plain, _, _, err := t.decryptWithFallback(data)
 	return plain, err
 }
 
-func (t *Tunnel) decryptPacketForServer(data []byte) ([]byte, *crypto.Cipher, error) {
+func (t *Tunnel) decryptPacketForServer(data []byte) ([]byte, *crypto.Cipher, uint64, error) {
 	return t.decryptWithFallback(data)
 }
 
 func (t *Tunnel) encryptForClient(client *ClientConnection, data []byte) ([]byte, error) {
 	if client != nil {
-		if c := client.getCipher(); c != nil {
+		if c, _ := client.getCipher(); c != nil {
 			return c.Encrypt(data)
 		}
 	}
 	return t.encryptPacket(data)
+}
+
+func (t *Tunnel) isPrevCipherActive(prev *crypto.Cipher) bool {
+	t.cipherMux.RLock()
+	defer t.cipherMux.RUnlock()
+	return prev != nil && t.prevCipher == prev
 }
 
 func (t *Tunnel) deactivatePrevCipher(prev *crypto.Cipher, reason string) {
@@ -2293,24 +2309,31 @@ func (t *Tunnel) deactivatePrevCipher(prev *crypto.Cipher, reason string) {
 	}
 
 	t.cipherMux.Lock()
+	prevGen := t.prevCipherGen
 	if t.prevCipher != prev {
 		t.cipherMux.Unlock()
 		return
 	}
 	t.prevCipher = nil
+	t.prevCipherGen = 0
 	t.prevCipherExp = time.Time{}
 	t.cipherMux.Unlock()
 
 	t.allClientsMux.RLock()
+	clients := make([]*ClientConnection, 0, len(t.allClients))
 	for client := range t.allClients {
-		if client.getCipher() == prev {
+		clients = append(clients, client)
+	}
+	t.allClientsMux.RUnlock()
+
+	for _, client := range clients {
+		if _, gen := client.getCipher(); gen != 0 && gen == prevGen {
 			client.stopOnce.Do(func() {
 				_ = client.conn.Close()
 				close(client.stopCh)
 			})
 		}
 	}
-	t.allClientsMux.RUnlock()
 
 	log.Printf("Deactivated previous cipher (%s)", reason)
 }
@@ -2352,12 +2375,16 @@ func (t *Tunnel) rotateCipher(newKey string) error {
 
 	t.cipherMux.Lock()
 	oldCipher := t.cipher
+	oldGen := t.cipherGen
 	t.cipher = newCipher
+	t.cipherGen++
 	if oldCipher != nil {
 		t.prevCipher = oldCipher
+		t.prevCipherGen = oldGen
 		t.prevCipherExp = time.Now().Add(KeyRotationGracePeriod)
 	} else {
 		t.prevCipher = nil
+		t.prevCipherGen = 0
 		t.prevCipherExp = time.Time{}
 	}
 	t.cipherMux.Unlock()
@@ -2371,8 +2398,11 @@ func (t *Tunnel) rotateCipher(newKey string) error {
 func (t *Tunnel) expirePrevCipher(prev *crypto.Cipher) {
 	timer := time.NewTimer(KeyRotationGracePeriod)
 	defer timer.Stop()
-	<-timer.C
-	t.deactivatePrevCipher(prev, "grace period expired")
+	select {
+	case <-timer.C:
+		t.deactivatePrevCipher(prev, "grace period expired")
+	case <-t.stopCh:
+	}
 }
 
 // reannounceP2PInfoAfterReconnect re-announces P2P info after reconnection with retry logic

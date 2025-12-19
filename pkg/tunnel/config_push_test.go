@@ -116,12 +116,13 @@ func TestKeyRotationGraceAndInvalidation(t *testing.T) {
 		clientRoutes: make(map[*ClientConnection][]string),
 		allClients:   make(map[*ClientConnection]struct{}),
 	}
+	tun.cipherGen = 1
 
 	client := &ClientConnection{
 		conn:   &mockConn{},
 		stopCh: make(chan struct{}),
 	}
-	client.setCipher(oldCipher)
+	client.setCipherWithGen(oldCipher, tun.cipherGen)
 	tun.trackClientConnection(client)
 
 	if err := tun.rotateCipher("new-key"); err != nil {
@@ -138,8 +139,8 @@ func TestKeyRotationGraceAndInvalidation(t *testing.T) {
 		t.Fatalf("encrypt with old cipher failed: %v", err)
 	}
 
-	if _, used, err := tun.decryptPacketForServer(encryptedOld); err != nil || used != oldCipher {
-		t.Fatalf("expected decrypt to succeed with old cipher during grace, used=%v err=%v", used, err)
+	if _, used, gen, err := tun.decryptPacketForServer(encryptedOld); err != nil || used != oldCipher || gen != tun.prevCipherGen {
+		t.Fatalf("expected decrypt to succeed with old cipher during grace, used=%v gen=%d err=%v", used, gen, err)
 	}
 
 	select {
@@ -154,8 +155,8 @@ func TestKeyRotationGraceAndInvalidation(t *testing.T) {
 		t.Fatalf("encrypt with new cipher failed: %v", err)
 	}
 
-	if _, used, err := tun.decryptPacketForServer(encryptedNew); err != nil || used != newCipher {
-		t.Fatalf("expected decrypt to use new cipher, used=%v err=%v", used, err)
+	if _, used, gen, err := tun.decryptPacketForServer(encryptedNew); err != nil || used != newCipher || gen != tun.cipherGen {
+		t.Fatalf("expected decrypt to use new cipher, used=%v gen=%d err=%v", used, gen, err)
 	}
 
 	if tun.prevCipher != nil {
@@ -168,7 +169,7 @@ func TestKeyRotationGraceAndInvalidation(t *testing.T) {
 		t.Fatalf("expected client with old key to be disconnected after new key is active")
 	}
 
-	if _, _, err := tun.decryptPacketForServer(encryptedOld); err == nil {
+	if _, _, _, err := tun.decryptPacketForServer(encryptedOld); err == nil {
 		t.Fatalf("expected old cipher to be invalid after new key confirmed")
 	}
 }
