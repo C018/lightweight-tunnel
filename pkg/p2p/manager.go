@@ -397,7 +397,7 @@ func (m *Manager) findPeerByAddr(addr *net.UDPAddr) net.IP {
 	}
 	
 	// Also check connections
-	for ipStr, conn := range m.connections {
+	for _, conn := range m.connections {
 		// Skip nil connections
 		if conn == nil || conn.RemoteAddr == nil {
 			continue
