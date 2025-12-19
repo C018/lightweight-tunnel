@@ -1356,34 +1356,21 @@ func (t *Tunnel) sendPacketWithRouting(packet []byte) error {
 					if err != nil {
 						log.Printf("P2P encryption error: %v", err)
 						// Mark peer as going through server on encryption failure
-						if peer := t.routingTable.GetPeer(dstIP); peer != nil {
-							peer.SetConnected(false)
-							peer.SetThroughServer(true)
-							t.routingTable.UpdateRoutes()
-						}
+						t.markPeerFallbackToServer(dstIP)
 						return t.sendViaServer(packet)
 					}
 
 					if err := t.p2pManager.SendPacket(dstIP, encryptedPacket); err != nil {
 						log.Printf("P2P send failed to %s, falling back to server: %v", dstIP, err)
 						// Mark peer as going through server on send failure
-						if peer := t.routingTable.GetPeer(dstIP); peer != nil {
-							peer.SetConnected(false)
-							peer.SetThroughServer(true)
-							// Update routes to switch to server route
-							t.routingTable.UpdateRoutes()
-						}
+						t.markPeerFallbackToServer(dstIP)
 						// Fall back to server
 						return t.sendViaServer(packet)
 					}
 					return nil
 				}
 				// P2P not connected despite direct route - update peer state
-				if peer := t.routingTable.GetPeer(dstIP); peer != nil {
-					peer.SetConnected(false)
-					peer.SetThroughServer(true)
-					t.routingTable.UpdateRoutes()
-				}
+				t.markPeerFallbackToServer(dstIP)
 				return t.sendViaServer(packet)
 			case routing.RouteRelay:
 				// Send via relay peer
@@ -1407,6 +1394,18 @@ func (t *Tunnel) sendViaServer(packet []byte) error {
 		return errors.New("tunnel stopped")
 	default:
 		return errors.New("send queue full")
+	}
+}
+
+// markPeerFallbackToServer updates routing state to force server relay for a peer.
+func (t *Tunnel) markPeerFallbackToServer(dstIP net.IP) {
+	if t.routingTable == nil {
+		return
+	}
+	if peer := t.routingTable.GetPeer(dstIP); peer != nil {
+		peer.SetConnected(false)
+		peer.SetThroughServer(true)
+		t.routingTable.UpdateRoutes()
 	}
 }
 
