@@ -398,6 +398,9 @@ func (m *Manager) SendPacket(peerIP net.IP, data []byte) error {
 		return fmt.Errorf("no P2P connection to %s", peerIP)
 	}
 	
+	// Record packet being sent (for quality monitoring)
+	m.RecordPacketSent(peerIP)
+	
 	// Send via UDP listener
 	_, err := m.listener.WriteToUDP(data, conn.RemoteAddr)
 	return err
@@ -452,6 +455,9 @@ func (m *Manager) receivePackets() {
 			if peerIP != nil {
 				// Update peer's last seen time
 				m.updatePeerLastSeen(peerIP)
+				
+				// Record packet received (for quality monitoring)
+				m.RecordPacketReceived(peerIP)
 				
 				// Call packet handler
 				m.mu.RLock()
