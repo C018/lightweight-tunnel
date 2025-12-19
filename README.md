@@ -14,7 +14,12 @@
 
 ## 📖 项目简介
 
-Lightweight Tunnel 是一个使用 Go 语言开发的轻量级内网穿透隧道工具。它通过 **UDP 传输并伪装成 TCP 流量**来绕过防火墙限制，同时内置 **AES-256-GCM 加密**和 **FEC 前向纠错**功能，在保证安全性的同时提供稳定可靠的网络连接。
+Lightweight Tunnel 是一个使用 Go 语言开发的轻量级内网穿透隧道工具。它支持两种TCP伪装模式：
+
+1. **Raw Socket模式（默认）**：通过 **Raw Socket 真正伪装成 TCP 流量**，类似udp2raw，在网络层就是真实的TCP包，可完美绕过严格的防火墙
+2. **UDP模式（兼容）**：通过UDP传输，在payload中添加TCP头部结构（适合不需要严格伪装的场景）
+
+同时内置 **AES-256-GCM 加密**和 **FEC 前向纠错**功能，在保证安全性的同时提供稳定可靠的网络连接。
 
 ### 适用场景
 
@@ -23,6 +28,7 @@ Lightweight Tunnel 是一个使用 Go 语言开发的轻量级内网穿透隧道
 - 🎮 **游戏联机**：为局域网游戏建立低延迟的虚拟局域网
 - 🔧 **开发测试**：在不同网络环境中快速建立开发测试网络
 - 🌐 **多点互联**：支持多个客户端组成 Hub 网络，任意节点间可直接通信
+- 🔥 **突破封锁**：使用Raw Socket模式真正伪装成TCP，绕过严格的防火墙和DPI检测
 
 ---
 
@@ -31,7 +37,14 @@ Lightweight Tunnel 是一个使用 Go 语言开发的轻量级内网穿透隧道
 ### 🚀 高性能与稳定性
 
 - **基于 UDP 传输**：避免 TCP-over-TCP 问题，延迟更低，性能更好
-- **TCP 流量伪装**：UDP 数据包被包装成 TCP 格式，可穿透严格的防火墙
+- **真实TCP流量伪装（Raw Socket模式）**：使用Raw Socket构造真实的TCP/IP包，完美伪装成TCP连接
+  - 在网络层就是TCP协议（IP协议号=6）
+  - 包含完整的TCP三次握手
+  - 真实的TCP序列号和确认号
+  - 完整的TCP选项（MSS、SACK、Timestamp等）
+  - 正确计算的TCP/IP校验和
+  - 自动管理iptables规则，防止内核RST干扰
+- **UDP模式（兼容）**：在UDP payload中添加TCP头部，适合不需要严格伪装的场景
 - **FEC 前向纠错**：通过冗余数据自动恢复丢失的数据包，无需重传
 - **智能队列管理**：可配置的发送/接收队列，适应不同带宽环境
 - **高并发处理**：基于 Go 协程的异步处理架构，支持高并发场景
@@ -115,12 +128,37 @@ Lightweight Tunnel 是一个使用 Go 语言开发的轻量级内网穿透隧道
 - **认证标签**：16 字节的认证标签确保数据完整性
 - **开销**：每个数据包增加 28 字节（12 字节 nonce + 16 字节标签）
 
-#### 4. TCP 伪装层
+#### 4. TCP 伪装层（两种模式）
 
-- 在 UDP 数据包外部添加伪造的 TCP 头部
-- 包含源端口、目标端口、序列号、确认号等 TCP 字段
-- 简单的防火墙会将其识别为 TCP 流量
-- 注意：深度包检测 (DPI) 可能识破伪装
+**🔥 Raw Socket模式（rawtcp，默认）**：
+- 使用Raw Socket构造完整的IP/TCP数据包
+- 在网络层就是真实的TCP协议（IP协议号=6）
+- 实现完整的TCP三次握手（SYN、SYN-ACK、ACK）
+- 维护真实的TCP序列号和确认号
+- 包含完整的TCP选项（MSS、SACK、Window Scale、Timestamp）
+- 正确计算TCP校验和和IP校验和
+- 自动管理iptables规则，阻止内核发送RST包
+- **类似udp2raw**，可完美绕过严格的TCP-only防火墙和DPI检测
+- **需要root权限**
+
+**UDP模式（udp，兼容）**：
+- 使用标准UDP socket传输
+- 在UDP payload中添加TCP头部结构
+- 适合不需要严格伪装的场景
+- 不需要root权限
+- 注意：深度包检测 (DPI) 可轻易识破
+
+**技术对比**：
+
+| 特性 | Raw Socket模式 | UDP模式 |
+|------|---------------|---------|
+| 网络层协议 | TCP (协议号=6) | UDP (协议号=17) |
+| 防火墙伪装 | ✅ 完美 | ⚠️ 弱 |
+| DPI抵御 | ✅ 强 | ❌ 无 |
+| Root权限 | ✅ 需要 | ❌ 不需要 |
+| Iptables | ✅ 自动管理 | ❌ 不需要 |
+| 实现复杂度 | 高 | 低 |
+| 类似项目 | udp2raw | - |
 
 #### 5. P2P 直连机制
 
@@ -400,6 +438,7 @@ sudo ./lightweight-tunnel \
 ```json
 {
   "mode": "server",
+  "transport": "rawtcp",
   "local_addr": "0.0.0.0:9000",
   "tunnel_addr": "10.0.0.1/24",
   "key": "change-this-to-your-strong-secret-key",
@@ -421,6 +460,7 @@ sudo ./lightweight-tunnel \
 | 字段 | 说明 | 推荐值 |
 |------|------|--------|
 | `mode` | 运行模式 | `server` 或 `client` |
+| `transport` | 传输模式 | `rawtcp` (真实TCP伪装，默认)<br>`udp` (UDP+假TCP头) |
 | `local_addr` | 监听地址（服务端） | `0.0.0.0:9000` |
 | `tunnel_addr` | 虚拟网络地址 | `10.0.0.1/24` |
 | `key` | 加密密钥 | 16+ 字符的强密码 |
@@ -434,6 +474,25 @@ sudo ./lightweight-tunnel \
 | `multi_client` | 启用多客户端 | `true` (Hub 模式)<br>`false` (点对点) |
 | `max_clients` | 最大客户端数 | 100 |
 | `client_isolation` | 客户端隔离 | `false` (可互访)<br>`true` (隔离) |
+
+### 🔥 重要：transport 传输模式说明
+
+**rawtcp模式（推荐，默认）**：
+- ✅ 使用Raw Socket构造真实的TCP/IP包
+- ✅ 在网络层就是TCP协议（IP协议号=6）
+- ✅ 可完美绕过严格的TCP-only防火墙
+- ✅ 可抵御深度包检测（DPI）
+- ⚠️ **需要root权限**
+- ⚠️ **自动管理iptables规则**（防止内核RST）
+- ⚡ 类似udp2raw的真实TCP伪装
+
+**udp模式（兼容）**：
+- ✅ 使用标准UDP socket
+- ✅ 不需要root权限
+- ✅ 实现简单，易于调试
+- ❌ UDP包+TCP头在payload中
+- ❌ 简单防火墙即可识别（UDP协议号=17）
+- ❌ 无法绕过严格的TCP-only防火墙
 
 #### 客户端完整配置示例
 

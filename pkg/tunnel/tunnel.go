@@ -43,7 +43,7 @@ const (
 
 // ClientConnection represents a single client connection
 type ClientConnection struct {
-	conn      *faketcp.Conn
+	conn      faketcp.ConnAdapter  // Changed to interface for both UDP and Raw socket modes
 	sendQueue chan []byte
 	recvQueue chan []byte
 	clientIP  net.IP
@@ -60,8 +60,8 @@ type Tunnel struct {
 	config     *config.Config
 	fec        *fec.FEC
 	cipher     *crypto.Cipher               // Encryption cipher (nil if no key)
-	conn       *faketcp.Conn                // Used in client mode
-	listener   *faketcp.Listener            // Used in server mode
+	conn       faketcp.ConnAdapter          // Used in client mode (interface for both modes)
+	listener   faketcp.ListenerAdapter      // Used in server mode (interface for both modes)
 	clients    map[string]*ClientConnection // Used in server mode (key: IP address)
 	clientsMux sync.RWMutex
 	tunName    string
@@ -83,6 +83,22 @@ type Tunnel struct {
 
 // NewTunnel creates a new tunnel instance
 func NewTunnel(cfg *config.Config) (*Tunnel, error) {
+	// Set faketcp mode based on transport configuration
+	if cfg.Transport == "rawtcp" || cfg.Transport == "raw" {
+		faketcp.SetMode(faketcp.ModeRaw)
+		// Check if raw socket is supported
+		if err := faketcp.CheckRawSocketSupport(); err != nil {
+			log.Printf("WARNING: Raw socket mode requested but not supported: %v", err)
+			log.Printf("Falling back to UDP mode (fake TCP headers in payload)")
+			faketcp.SetMode(faketcp.ModeUDP)
+		} else {
+			log.Printf("Using Raw Socket mode (真正的TCP伪装，类似udp2raw)")
+		}
+	} else {
+		faketcp.SetMode(faketcp.ModeUDP)
+		log.Printf("Using UDP mode (fake TCP headers in payload)")
+	}
+
 	// Create FEC encoder/decoder
 	fecCodec, err := fec.NewFEC(cfg.FECDataShards, cfg.FECParityShards, cfg.MTU/cfg.FECDataShards)
 	if err != nil {
@@ -419,8 +435,10 @@ func (t *Tunnel) connectClient() error {
 
 	timeout := time.Duration(t.config.Timeout) * time.Second
 
-	log.Println("Using UDP with fake TCP headers for firewall bypass")
-	conn, err := faketcp.Dial(t.config.RemoteAddr, timeout)
+	mode := faketcp.GetMode()
+	log.Printf("Using %s for firewall bypass", faketcp.ModeString(mode))
+	
+	conn, err := faketcp.DialWithMode(t.config.RemoteAddr, timeout, mode)
 	if err != nil {
 		return err
 	}
@@ -459,7 +477,8 @@ func (t *Tunnel) reconnectToServer() error {
 		}
 
 		log.Printf("Attempting to reconnect to server at %s (backoff %ds)", t.config.RemoteAddr, backoff)
-		conn, err := faketcp.Dial(t.config.RemoteAddr, timeout)
+		mode := faketcp.GetMode()
+		conn, err := faketcp.DialWithMode(t.config.RemoteAddr, timeout, mode)
 		if err == nil {
 			t.conn = conn
 			log.Printf("Reconnected to server: %s -> %s", conn.LocalAddr(), conn.RemoteAddr())
@@ -481,8 +500,10 @@ func (t *Tunnel) reconnectToServer() error {
 func (t *Tunnel) startServer() error {
 	log.Printf("Listening on %s...", t.config.LocalAddr)
 
-	log.Println("Using UDP with fake TCP headers for firewall bypass")
-	listener, err := faketcp.Listen(t.config.LocalAddr)
+	mode := faketcp.GetMode()
+	log.Printf("Using %s for firewall bypass", faketcp.ModeString(mode))
+	
+	listener, err := faketcp.ListenWithMode(t.config.LocalAddr, mode)
 	if err != nil {
 		return err
 	}
@@ -509,7 +530,7 @@ func (t *Tunnel) startServer() error {
 }
 
 // acceptClients accepts multiple client connections
-func (t *Tunnel) acceptClients(listener *faketcp.Listener) {
+func (t *Tunnel) acceptClients(listener faketcp.ListenerAdapter) {
 	defer t.wg.Done()
 
 	for {
