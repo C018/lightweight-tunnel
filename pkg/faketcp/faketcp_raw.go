@@ -262,8 +262,10 @@ func (c *ConnRaw) recvLoop() {
 			c.mu.Unlock()
 
 			if c.isConnected {
-				_ = c.rawSocket.SendPacket(c.localIP, c.srcPort, c.remoteIP, c.dstPort,
-					seqToUse, ackToSend, ACK, c.buildTCPOptions(), nil)
+				if err := c.rawSocket.SendPacket(c.localIP, c.srcPort, c.remoteIP, c.dstPort,
+					seqToUse, ackToSend, ACK, c.buildTCPOptions(), nil); err != nil {
+					log.Printf("Failed to send ACK to %s:%d: %v", c.remoteIP, c.remotePort, err)
+				}
 			}
 		}
 
@@ -694,8 +696,10 @@ func (l *ListenerRaw) acceptLoop() {
 				conn.mu.Unlock()
 
 				// 立即回 ACK，避免长时间无反向流量导致被误判为异常
-				_ = l.rawSocket.SendPacket(conn.localIP, conn.srcPort, conn.remoteIP, conn.dstPort,
-					seqToUse, ackToSend, ACK, conn.buildTCPOptions(), nil)
+				if err := l.rawSocket.SendPacket(conn.localIP, conn.srcPort, conn.remoteIP, conn.dstPort,
+					seqToUse, ackToSend, ACK, conn.buildTCPOptions(), nil); err != nil {
+					log.Printf("Failed to send ACK to %s:%d: %v", conn.remoteIP, conn.remotePort, err)
+				}
 
 				tcpHdr := &TCPHeader{
 					SrcPort:    srcPort,
