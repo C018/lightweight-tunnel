@@ -225,6 +225,27 @@ make build
 # 编译后的二进制文件位于：bin/lightweight-tunnel
 ```
 
+#### 方式 3：注册为 systemd 服务（可自定义服务名与配置路径）
+
+```bash
+# 先构建
+make build
+
+# 安装为 systemd 服务，指定配置文件路径与服务名
+sudo make install-service CONFIG_PATH=/etc/lightweight-tunnel/config-server.json SERVICE_NAME=lightweight-tunnel-server
+# CONFIG_PATH 必填，服务默认以 lightweight-tunnel 系统用户运行（自动创建），请确保配置文件对该用户可读
+# systemd 单元仅授予 CAP_NET_ADMIN 与 CAP_NET_RAW（创建 TUN 与 Raw TCP 伪装所需），其余权限受限
+# 需要访问网络，因此 PrivateNetwork 保持为 no，同时启用了 PrivateTmp/ProtectHome 等隔离设置
+# CAP_NET_RAW 是构造原始 TCP 报文所必需的能力，请勿移除
+# 配置文件权限示例：
+sudo chown root:lightweight-tunnel /etc/lightweight-tunnel/config-server.json
+sudo chmod 640 /etc/lightweight-tunnel/config-server.json
+
+# 启动与查看状态
+sudo systemctl start lightweight-tunnel-server
+sudo systemctl status lightweight-tunnel-server
+```
+
 ---
 
 ## 📖 使用说明
@@ -338,7 +359,13 @@ sudo ./lightweight-tunnel \
   "local_addr": "0.0.0.0:9000",
   "tunnel_addr": "10.0.0.1/24",
   "key": "请修改为您的强密钥",
-  "mtu": 0
+  "mtu": 0,
+  "tun_name": "tun0",
+  "routes": [
+    "10.10.0.0/16",
+    "10.20.0.0/16"
+  ],
+  "config_push_interval": 600
 }
 ```
 
@@ -348,6 +375,9 @@ sudo ./lightweight-tunnel \
 - `tunnel_addr`: 虚拟网络 IP 地址
 - `key`: 加密密钥（**必须设置且双方一致**）
 - `mtu`: 最大传输单元（0 = 自动检测）
+- `tun_name`: 可选，指定 TUN 设备名称（冲突或非法时自动回退）
+- `routes`: 可选，宣告给服务端/对端的 CIDR 路由列表
+- `config_push_interval`: 可选，服务端定期下发新配置/密钥的间隔（秒，0=关闭）
 
 #### 客户端配置示例
 
@@ -358,7 +388,12 @@ sudo ./lightweight-tunnel \
   "remote_addr": "服务器IP:9000",
   "tunnel_addr": "10.0.0.2/24",
   "key": "请修改为您的强密钥",
-  "mtu": 0
+  "mtu": 0,
+  "tun_name": "tun1",
+  "routes": [
+    "10.10.0.0/16",
+    "10.20.0.0/16"
+  ]
 }
 ```
 
@@ -390,6 +425,12 @@ sudo ./lightweight-tunnel -c config-client.json
 可选参数：
   -mtu int
         最大传输单元（默认：1400，设置为 0 启用自动检测）
+  -tun-name string
+        指定 TUN 网卡名称（默认自动分配，如 tun0、tun1）
+  -routes string
+        以逗号分隔的 CIDR 路由列表，自动宣告给对端
+  -config-push-interval int
+        服务端定期下发新配置/密钥的间隔（秒，0=关闭）
   -send-queue int
         发送队列大小（默认：5000）
   -recv-queue int
@@ -415,6 +456,12 @@ sudo ./lightweight-tunnel -c config-client.json
   -v
         显示版本信息
 ```
+
+### 动态密钥轮换与路由宣告
+
+- **动态密钥下发**：服务端通过 `-config-push-interval` 定期生成新密钥并推送给客户端，客户端自动切换新密钥并重连，旧密钥立即失效。
+- **路由宣告**：使用 `-routes "10.10.0.0/16,10.20.0.0/16"` 将本端可达网段宣告给对端；服务端和客户端会自动安装/清理这些路由，需为合法 CIDR。
+- **多 TUN/多配置**：可用 `-tun-name tunX` 指定网卡名称；若名称冲突或非法会自动退回系统分配的名称，便于多配置并行（tun0、tun1 等）。
 
 ---
 
