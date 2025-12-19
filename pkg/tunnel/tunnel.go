@@ -7,6 +7,7 @@ import (
 	"net"
 	"os/exec"
 	"strings"
+	"strconv"
 	"sync"
 	"time"
 
@@ -1221,7 +1222,62 @@ func (t *Tunnel) handlePeerInfoFromServer(data []byte) {
 		
 		// Check if P2P is feasible based on NAT types
 		canEstablishP2P := t.p2pManager.CanEstablishP2PWith(tunnelIP)
-		shouldInitiate := t.p2pManager.ShouldInitiateConnectionToPeer(tunnelIP)
+
+		// Determine who should initiate the P2P connection.
+		// Primary: NAT level (lower is better). If equal, tie-break by
+		// registered port (smaller port initiates to larger). If ports equal,
+		// tie-break by tunnel IP last octet (smaller initiates to larger).
+		shouldInitiate := false
+
+		myNAT := t.p2pManager.GetNATType()
+		peerNAT := peer.GetNATType()
+
+		// If either NAT is unknown, default to initiating
+		if myNAT == nat.NATUnknown || peerNAT == nat.NATUnknown {
+			shouldInitiate = true
+		} else if myNAT.GetLevel() != peerNAT.GetLevel() {
+			// Different NAT levels: use existing logic (worse side initiates as implemented in NAT)
+			shouldInitiate = myNAT.ShouldInitiateConnection(peerNAT)
+		} else {
+			// Equal NAT level: tie-break by ports then tunnel IP last byte
+			myPort := t.p2pManager.GetLocalPort()
+			peerPort := 0
+
+			// Try to parse peer public address first, then local address
+			if peer.PublicAddr != "" {
+				if _, portStr, err := net.SplitHostPort(peer.PublicAddr); err == nil {
+					if p, err := strconv.Atoi(portStr); err == nil {
+						peerPort = p
+					}
+				}
+			}
+			if peerPort == 0 && peer.LocalAddr != "" {
+				if _, portStr, err := net.SplitHostPort(peer.LocalAddr); err == nil {
+					if p, err := strconv.Atoi(portStr); err == nil {
+						peerPort = p
+					}
+				}
+			}
+
+			if peerPort != 0 {
+				if myPort != peerPort {
+					shouldInitiate = myPort < peerPort
+				} else {
+					// Ports equal: compare last octet of tunnel IPs (IPv4 expected)
+					myIP4 := t.myTunnelIP.To4()
+					peerIP4 := peer.TunnelIP.To4()
+					if myIP4 != nil && peerIP4 != nil {
+						shouldInitiate = myIP4[len(myIP4)-1] < peerIP4[len(peerIP4)-1]
+					} else {
+						// Fallback to manager decision
+						shouldInitiate = t.p2pManager.ShouldInitiateConnectionToPeer(tunnelIP)
+					}
+				}
+			} else {
+				// Couldn't parse peer port; fallback to manager decision
+				shouldInitiate = t.p2pManager.ShouldInitiateConnectionToPeer(tunnelIP)
+			}
+		}
 		
 		if !canEstablishP2P {
 			log.Printf("P2P not feasible with %s (both Symmetric NAT), will use server relay", tunnelIP)

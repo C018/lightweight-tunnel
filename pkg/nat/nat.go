@@ -44,7 +44,7 @@ func (n NATType) String() string {
 }
 
 // GetLevel returns the NAT level (0=best for P2P, higher=worse for P2P)
-// Lower-level NAT should actively connect to higher-level NAT
+// Higher-level (worse) NAT should actively connect to lower-level (better) NAT
 func (n NATType) GetLevel() int {
 	switch n {
 	case NATNone:
@@ -89,10 +89,10 @@ func (n NATType) CanTraverseWith(other NATType) bool {
 }
 
 // ShouldInitiateConnection determines if this NAT should initiate connection to the other
-// Lower-level (better) NAT should connect to higher-level (worse) NAT for better stability
+// Higher-level (worse) NAT should initiate connections to lower-level (better) NAT
 func (n NATType) ShouldInitiateConnection(other NATType) bool {
-	// If we have a better NAT (lower level), we should initiate
-	return n.GetLevel() < other.GetLevel()
+	// If we have a worse NAT (higher level), we should initiate
+	return n.GetLevel() > other.GetLevel()
 }
 
 // Detector handles NAT type detection
