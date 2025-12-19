@@ -137,47 +137,61 @@ func DialRaw(remoteAddr string, timeout time.Duration) (*ConnRaw, error) {
 
 // performHandshake performs TCP three-way handshake
 func (c *ConnRaw) performHandshake(timeout time.Duration) error {
-	// Build and send SYN
+	// Build TCP options
 	tcpOptions := c.buildTCPOptions()
-	err := c.rawSocket.SendPacket(c.localIP, c.localPort, c.remoteIP, c.remotePort,
-		c.seqNum, 0, SYN, tcpOptions, nil)
-	if err != nil {
-		return fmt.Errorf("failed to send SYN: %v", err)
-	}
+	
+	// Retry mechanism for SYN
+	maxRetries := 3
+	retryInterval := 500 * time.Millisecond
+	
+	for retry := 0; retry < maxRetries; retry++ {
+		if retry > 0 {
+			log.Printf("Retrying handshake (attempt %d/%d)...", retry+1, maxRetries)
+			time.Sleep(retryInterval)
+		}
+		
+		// Send SYN
+		err := c.rawSocket.SendPacket(c.localIP, c.localPort, c.remoteIP, c.remotePort,
+			c.seqNum, 0, SYN, tcpOptions, nil)
+		if err != nil {
+			log.Printf("Failed to send SYN: %v", err)
+			continue
+		}
 
-	c.seqNum++ // SYN consumes one sequence number
-
-	// Wait for SYN-ACK
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		select {
-		case data := <-c.recvQueue:
-			// Parse TCP header from data
-			if len(data) < TCPHeaderSize {
-				continue
-			}
-			hdr := parseTCPHeader(data)
-			if hdr == nil {
-				continue
-			}
-			if hdr.Flags&(SYN|ACK) == (SYN | ACK) {
-				// Got SYN-ACK
-				c.ackNum = hdr.SeqNum + 1
-
-				// Send ACK
-				err = c.rawSocket.SendPacket(c.localIP, c.localPort, c.remoteIP, c.remotePort,
-					c.seqNum, c.ackNum, ACK, tcpOptions, nil)
-				if err != nil {
-					return fmt.Errorf("failed to send ACK: %v", err)
+		// Wait for SYN-ACK with timeout
+		deadline := time.Now().Add(timeout / time.Duration(maxRetries))
+		for time.Now().Before(deadline) {
+			select {
+			case data := <-c.recvQueue:
+				// Parse TCP header from data
+				if len(data) < TCPHeaderSize {
+					continue
 				}
-				return nil
+				hdr := parseTCPHeader(data)
+				if hdr == nil {
+					continue
+				}
+				if hdr.Flags&(SYN|ACK) == (SYN | ACK) {
+					// Got SYN-ACK
+					c.seqNum++ // SYN consumes one sequence number
+					c.ackNum = hdr.SeqNum + 1
+
+					// Send ACK
+					err = c.rawSocket.SendPacket(c.localIP, c.localPort, c.remoteIP, c.remotePort,
+						c.seqNum, c.ackNum, ACK, tcpOptions, nil)
+					if err != nil {
+						return fmt.Errorf("failed to send ACK: %v", err)
+					}
+					log.Printf("Handshake completed successfully")
+					return nil
+				}
+			case <-time.After(200 * time.Millisecond):
+				// Continue waiting
 			}
-		case <-time.After(100 * time.Millisecond):
-			// Continue waiting
 		}
 	}
 
-	return fmt.Errorf("handshake timeout")
+	return fmt.Errorf("handshake timeout after %d retries", maxRetries)
 }
 
 // recvLoop continuously receives packets from raw socket
@@ -192,8 +206,8 @@ func (c *ConnRaw) recvLoop() {
 		default:
 		}
 
-		// Set read timeout to allow checking stopCh (10ms for low latency)
-		c.rawSocket.SetReadTimeout(0, 10000)  // 10ms = 10000 microseconds
+		// Set read timeout to allow checking stopCh
+		c.rawSocket.SetReadTimeout(0, 100000)  // 100ms = 100000 microseconds
 
 		srcIP, srcPort, dstIP, dstPort, seq, ack, flags, payload, err := c.rawSocket.RecvPacket(buf)
 		if err != nil {
@@ -343,7 +357,7 @@ func (c *ConnRaw) ReadPacket() ([]byte, error) {
 			return []byte{}, nil
 		}
 		return data[headerLen:], nil
-	case <-time.After(100 * time.Millisecond):  // 降低超时到100ms
+	case <-time.After(500 * time.Millisecond):  // 500ms适合高延迟网络
 		return nil, &net.OpError{Op: "read", Net: "tcp", Err: fmt.Errorf("timeout")}
 	}
 }
@@ -529,7 +543,7 @@ func (l *ListenerRaw) acceptLoop() {
 		default:
 		}
 
-		l.rawSocket.SetReadTimeout(0, 10000)  // 10ms for low latency
+		l.rawSocket.SetReadTimeout(0, 100000)  // 100ms
 		srcIP, srcPort, dstIP, dstPort, seq, ack, flags, payload, err := l.rawSocket.RecvPacket(buf)
 		if err != nil {
 			continue
