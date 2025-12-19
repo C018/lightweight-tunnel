@@ -4,9 +4,14 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$REPO_DIR"
 
+if [ ! -d "$REPO_DIR/.git" ]; then
+  echo "This script must be run from the lightweight-tunnel git repository root."
+  exit 1
+fi
+
 echo "Pulling latest changes..."
 if ! git pull; then
-  echo "git pull failed. Please resolve local changes or merge conflicts, then rerun this script."
+  echo "git pull failed. Please ensure the repository is clean, resolve any merge conflicts, and verify network connectivity before rerunning this script."
   exit 1
 fi
 
@@ -24,11 +29,14 @@ if [ ! -f "$BIN_PATH" ]; then
   exit 1
 fi
 
-if ! command -v sudo >/dev/null 2>&1; then
+INSTALLER="sudo install -m 755"
+if [ -w "$(dirname "$TARGET")" ] && { [ ! -e "$TARGET" ] || [ -w "$TARGET" ]; }; then
+  INSTALLER="install -m 755"
+elif ! command -v sudo >/dev/null 2>&1; then
   echo "sudo is required to install to $TARGET."
   exit 1
 fi
 
-echo "Installing binary to $TARGET (requires sudo)..."
-sudo install -m 755 "$BIN_PATH" "$TARGET"
+echo "Installing binary to $TARGET (may prompt for sudo)..."
+$INSTALLER "$BIN_PATH" "$TARGET"
 echo "Update completed."
