@@ -34,6 +34,7 @@ type ConnRaw struct {
 	iptablesMgr *iptables.IPTablesManager
 	stopCh      chan struct{}
 	wg          sync.WaitGroup
+	isListener  bool // true表示这是listener接受的连接，不需要启动recvLoop
 }
 
 // NewConnRaw creates a new raw socket connection
