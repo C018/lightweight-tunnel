@@ -819,7 +819,8 @@ func (t *Tunnel) netReader() {
 		// Ensure we have a live connection
 		if t.conn == nil {
 			if err := t.reconnectToServer(); err != nil {
-				// Tunnel stopping or cannot reconnect
+				// Only return if tunnel is explicitly stopping
+				// reconnectToServer only returns error when stopCh is closed
 				return
 			}
 		}
@@ -834,8 +835,9 @@ func (t *Tunnel) netReader() {
 			select {
 			case <-t.stopCh:
 				// Tunnel is stopping, no need to log
+				return
 			default:
-				log.Printf("Network read error: %v", err)
+				log.Printf("Network read error: %v, attempting reconnection...", err)
 			}
 
 			// Close and clear current connection, then attempt reconnect
@@ -846,11 +848,14 @@ func (t *Tunnel) netReader() {
 			}
 			t.connMux.Unlock()
 
+			// Keep trying to reconnect - only exits if tunnel is stopping
 			if err := t.reconnectToServer(); err != nil {
+				// Only returns error when stopCh is closed
 				return
 			}
 
 			// Successfully reconnected, continue reading
+			log.Printf("Reconnection successful, resuming packet reception")
 			continue
 		}
 
@@ -964,6 +969,7 @@ func (t *Tunnel) netWriter() {
 			// Ensure we have a live connection before writing
 			if t.conn == nil {
 				if err := t.reconnectToServer(); err != nil {
+					// Only returns error when stopCh is closed
 					return
 				}
 			}
@@ -972,11 +978,12 @@ func (t *Tunnel) netWriter() {
 				select {
 				case <-t.stopCh:
 					// Tunnel is stopping, no need to log
+					return
 				default:
-					log.Printf("Network write error: %v", err)
+					log.Printf("Network write error: %v, attempting reconnection...", err)
 				}
 
-				// Close and clear connection then try to reconnect and retry once
+				// Close and clear connection then try to reconnect
 				t.connMux.Lock()
 				if t.conn != nil {
 					_ = t.conn.Close()
@@ -984,15 +991,19 @@ func (t *Tunnel) netWriter() {
 				}
 				t.connMux.Unlock()
 
+				// Keep trying to reconnect - only exits if tunnel is stopping
 				if err := t.reconnectToServer(); err != nil {
+					// Only returns error when stopCh is closed
 					return
 				}
 
 				// Try writing once more after reconnect
+				log.Printf("Reconnection successful, retrying packet send")
 				if t.conn != nil {
 					if err2 := t.conn.WritePacket(encryptedPacket); err2 != nil {
-						log.Printf("Network write retry failed: %v", err2)
-						return
+						log.Printf("Network write retry failed: %v, packet will be lost", err2)
+						// Don't return - continue processing queue
+						// The packet is lost but we keep the tunnel alive
 					}
 				}
 			}
@@ -1023,6 +1034,7 @@ func (t *Tunnel) keepalive() {
 			// Ensure we have a live connection
 			if t.conn == nil {
 				if err := t.reconnectToServer(); err != nil {
+					// Only returns error when stopCh is closed
 					return
 				}
 			}
@@ -1031,8 +1043,9 @@ func (t *Tunnel) keepalive() {
 				select {
 				case <-t.stopCh:
 					// Tunnel is stopping, no need to log
+					return
 				default:
-					log.Printf("Keepalive error: %v", err)
+					log.Printf("Keepalive error: %v, attempting reconnection...", err)
 				}
 
 				// Close and clear connection then attempt reconnect
@@ -1043,10 +1056,14 @@ func (t *Tunnel) keepalive() {
 				}
 				t.connMux.Unlock()
 
+				// Keep trying to reconnect - only exits if tunnel is stopping
 				if err := t.reconnectToServer(); err != nil {
+					// Only returns error when stopCh is closed
 					return
 				}
-				// don't return; let loop continue
+				
+				log.Printf("Reconnection successful, keepalive will resume")
+				// Don't return; let loop continue with the next tick
 			}
 		}
 	}
