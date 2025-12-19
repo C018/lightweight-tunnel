@@ -95,3 +95,81 @@ func TestPushConfigUpdateUsesAllClients(t *testing.T) {
 		t.Fatalf("expected client connection to be closed")
 	}
 }
+
+func TestKeyRotationGraceAndInvalidation(t *testing.T) {
+	cfg := &config.Config{
+		Mode:       "server",
+		TunnelAddr: "10.0.0.1/24",
+		Key:        "old-key",
+	}
+
+	oldCipher, err := crypto.NewCipher(cfg.Key)
+	if err != nil {
+		t.Fatalf("failed to create cipher: %v", err)
+	}
+
+	tun := &Tunnel{
+		config:       cfg,
+		cipher:       oldCipher,
+		stopCh:       make(chan struct{}),
+		clients:      make(map[string]*ClientConnection),
+		clientRoutes: make(map[*ClientConnection][]string),
+		allClients:   make(map[*ClientConnection]struct{}),
+	}
+	tun.cipherGen = 1
+
+	client := &ClientConnection{
+		conn:   &mockConn{},
+		stopCh: make(chan struct{}),
+	}
+	client.setCipherWithGen(oldCipher, tun.cipherGen)
+	tun.trackClientConnection(client)
+
+	if err := tun.rotateCipher("new-key"); err != nil {
+		t.Fatalf("rotateCipher failed: %v", err)
+	}
+
+	if tun.prevCipher != oldCipher {
+		t.Fatalf("expected previous cipher to be retained for grace period")
+	}
+
+	packet := []byte{PacketTypeKeepalive}
+	encryptedOld, err := oldCipher.Encrypt(packet)
+	if err != nil {
+		t.Fatalf("encrypt with old cipher failed: %v", err)
+	}
+
+	if _, used, gen, err := tun.decryptPacketForServer(encryptedOld); err != nil || used != oldCipher || gen != tun.prevCipherGen {
+		t.Fatalf("expected decrypt to succeed with old cipher during grace, used=%v gen=%d err=%v", used, gen, err)
+	}
+
+	select {
+	case <-client.stopCh:
+		t.Fatalf("client using old key should remain connected during grace period")
+	default:
+	}
+
+	newCipher := tun.cipher
+	encryptedNew, err := newCipher.Encrypt(packet)
+	if err != nil {
+		t.Fatalf("encrypt with new cipher failed: %v", err)
+	}
+
+	if _, used, gen, err := tun.decryptPacketForServer(encryptedNew); err != nil || used != newCipher || gen != tun.cipherGen {
+		t.Fatalf("expected decrypt to use new cipher, used=%v gen=%d err=%v", used, gen, err)
+	}
+
+	if tun.prevCipher != nil {
+		t.Fatalf("expected previous cipher to be cleared once new key is in use")
+	}
+
+	select {
+	case <-client.stopCh:
+	default:
+		t.Fatalf("expected client with old key to be disconnected after new key is active")
+	}
+
+	if _, _, _, err := tun.decryptPacketForServer(encryptedOld); err == nil {
+		t.Fatalf("expected old cipher to be invalid after new key confirmed")
+	}
+}
