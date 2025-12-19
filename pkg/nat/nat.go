@@ -198,14 +198,22 @@ func bytesInRange(ip, start, end net.IP) bool {
 		return false
 	}
 
+	// Check each byte: IP must be >= start and <= end
 	for i := range ip {
-		if ip[i] < start[i] || ip[i] > end[i] {
-			if ip[i] != start[i] {
-				return ip[i] > start[i] && ip[i] < end[i]
-			}
+		if ip[i] < start[i] {
+			return false
+		}
+		if ip[i] > end[i] {
+			return false
+		}
+		// If this byte is within the range but not equal to start/end,
+		// then the IP is strictly within range and we can return true
+		if ip[i] > start[i] && ip[i] < end[i] {
+			return true
 		}
 	}
 
+	// All bytes matched exactly or are at boundaries
 	return true
 }
 
