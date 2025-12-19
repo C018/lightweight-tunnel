@@ -34,19 +34,14 @@ if [ ! -f "$BIN_PATH" ]; then
   exit 1
 fi
 
-INSTALLER=()
-if [ -w "$(dirname "$TARGET")" ]; then
-  INSTALLER=(install -m 755)
-elif command -v sudo >/dev/null 2>&1; then
-  INSTALLER=(sudo install -m 755)
-else
-  echo "Cannot install to $TARGET: insufficient permissions and sudo is not available."
-  exit 1
+echo "Installing binary to $TARGET..."
+if ! install -m 755 "$BIN_PATH" "$TARGET"; then
+  if command -v sudo >/dev/null 2>&1; then
+    echo "Retrying with sudo..."
+    sudo install -m 755 "$BIN_PATH" "$TARGET"
+  else
+    echo "Installation failed and sudo is not available. Please check permissions for $TARGET."
+    exit 1
+  fi
 fi
-
-case "${INSTALLER[0]}" in
-  sudo) echo "Installing binary to $TARGET (may prompt for sudo)..." ;;
-  *) echo "Installing binary to $TARGET..." ;;
-esac
-"${INSTALLER[@]}" "$BIN_PATH" "$TARGET"
 echo "Update completed."
