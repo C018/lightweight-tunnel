@@ -42,6 +42,9 @@ const (
 	// PortPredictionSequentialRange is the range of sequential ports to prioritize
 	// Most NATs allocate ports sequentially, so try these first
 	PortPredictionSequentialRange = 5
+	// MaxBackoffMultiplier is the maximum multiplier for exponential backoff (caps retry interval)
+	// Max interval = KeepaliveInterval * MaxBackoffMultiplier = 15s * 8 = 120s
+	MaxBackoffMultiplier = 8
 )
 
 // Connection represents a P2P UDP connection to a peer
@@ -806,11 +809,10 @@ func (m *Manager) connectWithPortPrediction(peer *PeerInfo, peerTunnelIP net.IP)
 	// Priority 1: Try sequential ports first (most common NAT behavior)
 	// Many NATs allocate ports sequentially, so try nearby sequential ports
 	// Generate list programmatically based on PortPredictionSequentialRange
-	var sequentialPorts []int
+	// Pre-allocate slice for efficiency
+	sequentialPorts := make([]int, 0, PortPredictionSequentialRange*2)
 	for offset := 1; offset <= PortPredictionSequentialRange; offset++ {
 		sequentialPorts = append(sequentialPorts, basePort+offset)
-	}
-	for offset := 1; offset <= PortPredictionSequentialRange; offset++ {
 		sequentialPorts = append(sequentialPorts, basePort-offset)
 	}
 	
@@ -939,8 +941,8 @@ func (m *Manager) sendKeepalives() {
 			conn.mu.Lock()
 			conn.consecutiveFailures++
 			backoffMultiplier := 1 << uint(failures) // 2^failures
-			if backoffMultiplier > 8 {
-				backoffMultiplier = 8 // Cap at 8x = 120 seconds
+			if backoffMultiplier > MaxBackoffMultiplier {
+				backoffMultiplier = MaxBackoffMultiplier
 			}
 			nextAttemptDelay := KeepaliveInterval * time.Duration(backoffMultiplier)
 			conn.nextHandshakeAttemptAt = now.Add(nextAttemptDelay)
