@@ -518,7 +518,6 @@ func (t *Tunnel) reconnectToServer() error {
 	defer t.connMux.Unlock()
 
 	backoff := 1
-	timeout := time.Duration(t.config.Timeout) * time.Second
 	handshakeTimeout := 500 * time.Millisecond
 
 	for {
