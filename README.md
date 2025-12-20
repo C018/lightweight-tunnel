@@ -267,7 +267,7 @@ sudo make install-service \
 # 配置文件权限示例：
 sudo mkdir -p /etc/lightweight-tunnel
 sudo chown root:lightweight-tunnel /etc/lightweight-tunnel/*.json
-sudo chmod 640 /etc/lightweight-tunnel/*.json
+sudo chmod 777 /etc/lightweight-tunnel/*.json
 
 # 启动服务
 sudo systemctl start lightweight-tunnel-server
