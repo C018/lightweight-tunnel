@@ -304,9 +304,9 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 	var accel *xdp.Accelerator
 	if cfg.EnableXDP {
 		accel = xdp.NewAccelerator(true)
-		log.Println("✅ 启用 eBPF/XDP Fast Path：针对加密流量的快速分类")
+		log.Println("✅ eBPF/XDP fast path enabled for encrypted-flow classification")
 	} else {
-		log.Println("XDP Fast Path 已关闭，使用常规路径")
+		log.Println("XDP fast path disabled, using regular path")
 	}
 
 	t := &Tunnel{

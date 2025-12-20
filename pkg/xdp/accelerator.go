@@ -5,6 +5,14 @@ import (
 	"sync"
 )
 
+const (
+	ipProtoTCP       = 6
+	ipProtoUDP       = 17
+	ipv4Version      = 4
+	ipv4MinHeaderLen = 20
+	minPortBytes     = 4
+)
+
 // Accelerator provides a lightweight, user-space approximation of an
 // eBPF/XDP classifier. It caches flow decisions to avoid repeatedly
 // inspecting the same encrypted flows while keeping the code portable.
@@ -23,7 +31,7 @@ func NewAccelerator(enabled bool) *Accelerator {
 // The decision is cached per 5-tuple to mimic an XDP fast path.
 func (a *Accelerator) Classify(ipPacket []byte, fallback func([]byte) bool) bool {
 	if fallback == nil {
-		return false
+		panic("xdp.Accelerator requires a fallback classifier")
 	}
 	if !a.enabled {
 		return fallback(ipPacket)
@@ -54,10 +62,10 @@ type flowKey struct {
 }
 
 func flowKeyFromPacket(ipPacket []byte) (flowKey, bool) {
-	if len(ipPacket) < 20 {
+	if len(ipPacket) < ipv4MinHeaderLen {
 		return flowKey{}, false
 	}
-	if ipPacket[0]>>4 != 4 {
+	if ipPacket[0]>>4 != ipv4Version {
 		return flowKey{}, false
 	}
 
@@ -72,8 +80,8 @@ func flowKeyFromPacket(ipPacket []byte) (flowKey, bool) {
 	key.proto = ipPacket[9]
 
 	switch key.proto {
-	case 6, 17: // TCP or UDP
-		if len(ipPacket) < ihl+4 {
+	case ipProtoTCP, ipProtoUDP:
+		if len(ipPacket) < ihl+minPortBytes {
 			return flowKey{}, false
 		}
 		payload := ipPacket[ihl:]
@@ -88,5 +96,8 @@ func flowKeyFromPacket(ipPacket []byte) (flowKey, bool) {
 
 // Flush clears cached flow decisions.
 func (a *Accelerator) Flush() {
-	a.cache = sync.Map{}
+	a.cache.Range(func(key, _ any) bool {
+		a.cache.Delete(key)
+		return true
+	})
 }

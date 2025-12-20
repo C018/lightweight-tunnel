@@ -5,6 +5,10 @@ import "encoding/binary"
 const (
 	quicMinEncryptedPayload = 16
 	maxEntropySampleSize    = 8
+	tlsRecordHandshake      = 0x16
+	tlsRecordChangeCipher   = 0x14
+	tlsRecordApplication    = 0x17
+	tlsRecordAlert          = 0x15
 )
 
 var encryptedServicePorts = map[uint16]struct{}{
@@ -78,7 +82,7 @@ func looksLikeTLS(payload []byte) bool {
 	if versionMajor != 0x03 {
 		return false
 	}
-	if recordType == 0x16 || recordType == 0x14 || recordType == 0x17 || recordType == 0x15 {
+	if recordType == tlsRecordHandshake || recordType == tlsRecordChangeCipher || recordType == tlsRecordApplication || recordType == tlsRecordAlert {
 		switch versionMinor {
 		case 0x00, 0x01, 0x02, 0x03, 0x04:
 			return true
