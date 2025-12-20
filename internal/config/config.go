@@ -38,6 +38,7 @@ type Config struct {
 	P2PTimeout          int  `json:"p2p_timeout"`           // P2P connection timeout in seconds (default 5)
 	EnableNATDetection  bool `json:"enable_nat_detection"`  // Enable automatic NAT type detection (default true)
 	EnableXDP           bool `json:"enable_xdp"`            // Enable lightweight XDP/eBPF fast-path classification
+	EnableKernelTune    bool `json:"enable_kernel_tune"`    // Apply kernel tunings (TFO/BBR2) on startup
 }
 
 // DefaultConfig returns a default configuration
@@ -69,6 +70,7 @@ func DefaultConfig() *Config {
 		P2PTimeout:          5,
 		EnableNATDetection:  true,
 		EnableXDP:           true,
+		EnableKernelTune:    true,
 	}
 }
 
@@ -145,6 +147,9 @@ func LoadConfig(filename string) (*Config, error) {
 	}
 	if _, exists := rawConfig["enable_xdp"]; !exists {
 		config.EnableXDP = true
+	}
+	if _, exists := rawConfig["enable_kernel_tune"]; !exists {
+		config.EnableKernelTune = true
 	}
 
 	return &config, nil

@@ -44,6 +44,7 @@ func main() {
 	routeUpdateInterval := flag.Int("route-update", 30, "Route quality check interval in seconds")
 	enableNATDetection := flag.Bool("nat-detection", true, "Enable automatic NAT type detection")
 	enableXDP := flag.Bool("xdp", true, "Enable eBPF/XDP-style fast path classification to reduce CPU cost")
+	enableKernelTune := flag.Bool("kernel-tune", true, "Enable kernel tuning (TFO/BBR2) on startup")
 	showVersion := flag.Bool("v", false, "Show version")
 	generateConfig := flag.String("g", "", "Generate example config file")
 	// TLS flags removed: TLS over the UDP fake-TCP transport is not supported.
@@ -106,6 +107,7 @@ func main() {
 			EnableNATDetection:  *enableNATDetection,
 			P2PTimeout:          5,
 			EnableXDP:           *enableXDP,
+			EnableKernelTune:    *enableKernelTune,
 		}
 	}
 

@@ -224,6 +224,9 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 			"错误详情: %v", cfg.Mode, err)
 	}
 
+	// Apply kernel-level optimizations (best effort)
+	applyKernelTunings(cfg.EnableKernelTune)
+
 	log.Printf("✅ 使用 Raw Socket 模式 (真正的TCP伪装，类似udp2raw)")
 	log.Printf("✅ 性能优化：低延迟，高吞吐量")
 
@@ -2426,6 +2429,33 @@ func GetPeerIP(tunnelAddr string) (string, error) {
 	}
 
 	return fmt.Sprintf("%s/%s", ip4.String(), parts[1]), nil
+}
+
+func applyKernelTunings(enabled bool) {
+	if !enabled {
+		return
+	}
+	// Enable TCP Fast Open for client+server (3)
+	if err := runSysctl("net.ipv4.tcp_fastopen=3"); err != nil {
+		log.Printf("⚠️  Failed to enable TCP Fast Open: %v", err)
+	} else {
+		log.Println("TCP Fast Open enabled (net.ipv4.tcp_fastopen=3)")
+	}
+
+	// Prefer BBR2 congestion control if available; fallback silently if kernel lacks it.
+	if err := runSysctl("net.ipv4.tcp_congestion_control=bbr2"); err != nil {
+		log.Printf("⚠️  Failed to set BBR2 congestion control (kernel may not support bbr2): %v", err)
+	} else {
+		log.Println("BBR2 congestion control enabled")
+	}
+}
+
+func runSysctl(setting string) error {
+	cmd := exec.Command("sysctl", "-w", setting)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("%v (output: %s)", err, strings.TrimSpace(string(output)))
+	}
+	return nil
 }
 
 func (t *Tunnel) shouldSkipOuterEncryption(data []byte) bool {
