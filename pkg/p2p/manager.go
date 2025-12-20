@@ -64,6 +64,7 @@ type Connection struct {
 	handshakeStartTime      time.Time     // When handshake started (for RTT measurement)
 	consecutiveFailures     int           // Number of consecutive failed handshake attempts
 	nextHandshakeAttemptAt  time.Time     // When next handshake attempt is allowed (for rate limiting)
+	handshakeInProgress     bool          // Whether a handshake goroutine is currently running
 	mu                      sync.RWMutex  // Protects connection state
 }
 
@@ -190,14 +191,25 @@ func (m *Manager) ConnectToPeer(peerTunnelIP net.IP) error {
 	
 	ipStr := peerTunnelIP.String()
 	
-	// Check if already connected
-	if _, exists := m.connections[ipStr]; exists {
+	// Check if already connected or handshake in progress
+	if existingConn, exists := m.connections[ipStr]; exists {
 		// Check if peer is actually marked as connected
 		if m.isPeerConnected(ipStr) {
 			log.Printf("Already connected to peer %s", ipStr)
 			return nil
 		}
-		// Reuse existing connection for retry
+		
+		// Check if handshake is already in progress
+		existingConn.mu.RLock()
+		inProgress := existingConn.handshakeInProgress
+		existingConn.mu.RUnlock()
+		
+		if inProgress {
+			log.Printf("Handshake already in progress for peer %s, skipping duplicate attempt", ipStr)
+			return nil
+		}
+		
+		// Handshake completed but connection failed, can retry
 		log.Printf("Retrying P2P connection to %s", ipStr)
 	}
 	
@@ -234,13 +246,14 @@ func (m *Manager) ConnectToPeer(peerTunnelIP net.IP) error {
 		if err == nil {
 			// Create connection object with local address (highest priority)
 			conn := &Connection{
-				RemoteAddr:         localAddr,
-				PeerIP:             peerTunnelIP,
-				IsLocalNetwork:     true,
-				sendQueue:          make(chan []byte, 100),
-				stopCh:             make(chan struct{}),
-				handshakeStartTime: time.Now(),
-				lastHandshakeTime:  time.Now(),
+				RemoteAddr:          localAddr,
+				PeerIP:              peerTunnelIP,
+				IsLocalNetwork:      true,
+				sendQueue:           make(chan []byte, 100),
+				stopCh:              make(chan struct{}),
+				handshakeStartTime:  time.Now(),
+				lastHandshakeTime:   time.Now(),
+				handshakeInProgress: true, // Mark handshake as in progress
 			}
 			m.connections[ipStr] = conn
 			
@@ -261,13 +274,14 @@ func (m *Manager) ConnectToPeer(peerTunnelIP net.IP) error {
 	
 	// Create connection with public address
 	conn := &Connection{
-		RemoteAddr:         remoteAddr,
-		PeerIP:             peerTunnelIP,
-		IsLocalNetwork:     false,
-		sendQueue:          make(chan []byte, 100),
-		stopCh:             make(chan struct{}),
-		handshakeStartTime: time.Now(),
-		lastHandshakeTime:  time.Now(),
+		RemoteAddr:          remoteAddr,
+		PeerIP:              peerTunnelIP,
+		IsLocalNetwork:      false,
+		sendQueue:           make(chan []byte, 100),
+		stopCh:              make(chan struct{}),
+		handshakeStartTime:  time.Now(),
+		lastHandshakeTime:   time.Now(),
+		handshakeInProgress: true, // Mark handshake as in progress
 	}
 	m.connections[ipStr] = conn
 	
@@ -281,6 +295,13 @@ func (m *Manager) ConnectToPeer(peerTunnelIP net.IP) error {
 
 // performHandshakeWithFallback tries local address first, then falls back to public address
 func (m *Manager) performHandshakeWithFallback(conn *Connection, peer *PeerInfo) {
+	// Ensure we clear the handshakeInProgress flag when done
+	defer func() {
+		conn.mu.Lock()
+		conn.handshakeInProgress = false
+		conn.mu.Unlock()
+	}()
+	
 	ipStr := conn.PeerIP.String()
 	
 	// First: Try local address with timeout
@@ -309,8 +330,12 @@ func (m *Manager) performHandshakeWithFallback(conn *Connection, peer *PeerInfo)
 	conn.IsLocalNetwork = false
 	m.mu.Unlock()
 	
-	// Perform handshake to public address
-	m.performHandshake(conn, false)
+	// Perform handshake to public address (without defer since it's called as function)
+	// Note: performHandshake will not clear the flag since we have defer here
+	conn.mu.Lock()
+	conn.handshakeInProgress = true // Reset flag for the public handshake
+	conn.mu.Unlock()
+	m.performHandshakeInternal(conn, false)
 }
 
 // tryHandshakeWithTimeout attempts handshake with a specific timeout
@@ -341,8 +366,20 @@ func (m *Manager) tryHandshakeWithTimeout(conn *Connection, timeout time.Duratio
 	return false
 }
 
-// performHandshake performs NAT hole punching handshake with aggressive retry strategy
+// performHandshake is a wrapper that manages the handshakeInProgress flag
 func (m *Manager) performHandshake(conn *Connection, isLocal bool) {
+	// Ensure we clear the handshakeInProgress flag when done
+	defer func() {
+		conn.mu.Lock()
+		conn.handshakeInProgress = false
+		conn.mu.Unlock()
+	}()
+	
+	m.performHandshakeInternal(conn, isLocal)
+}
+
+// performHandshakeInternal performs NAT hole punching handshake with aggressive retry strategy
+func (m *Manager) performHandshakeInternal(conn *Connection, isLocal bool) {
 	// Initial burst: Send multiple handshake packets rapidly to establish NAT mapping
 	handshakeMsg := []byte("P2P_HANDSHAKE")
 	
@@ -351,6 +388,15 @@ func (m *Manager) performHandshake(conn *Connection, isLocal bool) {
 	
 	// Phase 1: Initial rapid burst
 	for i := 0; i < HandshakeAttempts; i++ {
+		// Check if connection established before each packet (more responsive)
+		m.mu.RLock()
+		connected := m.isPeerConnected(conn.PeerIP.String())
+		m.mu.RUnlock()
+		if connected {
+			log.Printf("P2P connection established during handshake burst (attempt %d)", i+1)
+			return
+		}
+		
 		conn.mu.Lock()
 		conn.lastHandshakeTime = time.Now()
 		conn.mu.Unlock()
@@ -358,17 +404,6 @@ func (m *Manager) performHandshake(conn *Connection, isLocal bool) {
 		_, err := m.listener.WriteToUDP(handshakeMsg, conn.RemoteAddr)
 		if err != nil {
 			log.Printf("Handshake send error to %s: %v", conn.PeerIP, err)
-		}
-		
-		// Check if connection established during burst
-		if i > 0 && i%HandshakeCheckInterval == 0 {
-			m.mu.RLock()
-			connected := m.isPeerConnected(conn.PeerIP.String())
-			m.mu.RUnlock()
-			if connected {
-				log.Printf("P2P connection established during handshake burst (attempt %d)", i+1)
-				return
-			}
 		}
 		
 		time.Sleep(HandshakeInterval)
@@ -391,6 +426,15 @@ func (m *Manager) performHandshake(conn *Connection, isLocal bool) {
 		// Send another burst
 		log.Printf("Retry phase %d/%d for %s", retry+1, HandshakeContinuousRetries, conn.PeerIP)
 		for i := 0; i < HandshakeAttempts/2; i++ {
+			// Check connection status before each packet in retry phase too
+			m.mu.RLock()
+			connected := m.isPeerConnected(conn.PeerIP.String())
+			m.mu.RUnlock()
+			if connected {
+				log.Printf("P2P connection established during retry burst (retry %d, attempt %d)", retry+1, i+1)
+				return
+			}
+			
 			conn.mu.Lock()
 			conn.lastHandshakeTime = time.Now()
 			conn.mu.Unlock()
