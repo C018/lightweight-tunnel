@@ -5,10 +5,15 @@ import "encoding/binary"
 const (
 	quicMinEncryptedPayload = 16
 	maxEntropySampleSize    = 8
+	tlsVersionMajor         = 0x03
 	tlsRecordHandshake      = 0x16
 	tlsRecordChangeCipher   = 0x14
 	tlsRecordApplication    = 0x17
 	tlsRecordAlert          = 0x15
+	asciiPrintableMin       = 0x20
+	asciiPrintableMax       = 0x7E
+	entropyThresholdDivisor = 2
+	entropyThresholdOffset  = 1
 )
 
 var encryptedServicePorts = map[uint16]struct{}{
@@ -79,7 +84,7 @@ func looksLikeTLS(payload []byte) bool {
 	recordType := payload[0]
 	versionMajor := payload[1]
 	versionMinor := payload[2]
-	if versionMajor != 0x03 {
+	if versionMajor != tlsVersionMajor {
 		return false
 	}
 	if recordType == tlsRecordHandshake || recordType == tlsRecordChangeCipher || recordType == tlsRecordApplication || recordType == tlsRecordAlert {
@@ -127,9 +132,9 @@ func looksLikeAEADProxy(payload []byte) bool {
 		if checkLen > maxEntropySampleSize {
 			checkLen = maxEntropySampleSize
 		}
-		threshold := checkLen/2 + 1
+		threshold := checkLen/entropyThresholdDivisor + entropyThresholdOffset
 		for i := 0; i < checkLen; i++ {
-			if payload[i] < 0x20 || payload[i] > 0x7E {
+			if payload[i] < asciiPrintableMin || payload[i] > asciiPrintableMax {
 				nonPrintable++
 			}
 		}

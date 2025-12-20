@@ -6,6 +6,7 @@ import (
 )
 
 const (
+	// Local copy of IPv4 constants (mirrors tunnel package, kept here to avoid import cycles).
 	ipProtoTCP       = 6
 	ipProtoUDP       = 17
 	ipv4Version      = 4
