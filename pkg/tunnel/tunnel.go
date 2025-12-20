@@ -58,6 +58,8 @@ const (
 	// Rotation and advertisement timing
 	KeyRotationGracePeriod     = 15 * time.Second
 	DefaultRouteAdvertInterval = 60 * time.Second
+
+	packetBufferSlack = 128 // Extra bytes to leave headroom for prepending headers without reallocations
 )
 
 // enqueueWithTimeout attempts to enqueue a packet, waiting briefly for capacity.
@@ -168,6 +170,9 @@ type Tunnel struct {
 	clientRoutes     map[*ClientConnection][]string
 }
 
+// prependPacketType adds a leading packet type byte to the payload.
+// It prefers in-place expansion when spare capacity exists and returns a
+// boolean indicating whether the original backing buffer was reused.
 func prependPacketType(packet []byte, packetType byte) ([]byte, bool) {
 	origLen := len(packet)
 	if cap(packet) > origLen {
@@ -183,13 +188,16 @@ func prependPacketType(packet []byte, packetType byte) ([]byte, bool) {
 	return newPacket, false
 }
 
+// getPacketBuffer pulls a reusable packet buffer sized for tunnel traffic.
 func (t *Tunnel) getPacketBuffer() []byte {
 	if t.packetPool == nil || t.packetBufSize == 0 {
-		return make([]byte, t.config.MTU+128)
+		return make([]byte, t.config.MTU+packetBufferSlack)
 	}
 	return t.packetPool.Get().([]byte)
 }
 
+// releasePacketBuffer returns a buffer to the pool when it matches the
+// expected capacity, keeping pooled slices uniform.
 func (t *Tunnel) releasePacketBuffer(buf []byte) {
 	if t.packetPool == nil || t.packetBufSize == 0 {
 		return
@@ -284,7 +292,7 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 		}
 	}
 
-	packetBufSize := cfg.MTU + 128
+	packetBufSize := cfg.MTU + packetBufferSlack
 	t := &Tunnel{
 		config:         cfg,
 		configFilePath: configFilePath,
@@ -872,6 +880,7 @@ func (t *Tunnel) tunReader() {
 		}
 
 		buf := t.getPacketBuffer()
+		// Leave one byte headroom so prependPacketType can reuse the buffer without reallocating.
 		readBuf := buf[:t.packetBufSize-1]
 		n, err := t.tunFile.Read(readBuf)
 		if err != nil {
@@ -904,7 +913,7 @@ func (t *Tunnel) tunReader() {
 			if t.config.P2PEnabled && t.routingTable != nil {
 				queued, err := t.sendPacketWithRouting(packet)
 				if !queued {
-					t.releasePacketBuffer(packet)
+					t.releasePacketBuffer(buf)
 				}
 				if err != nil {
 					log.Printf("Failed to send packet: %v", err)
@@ -914,12 +923,12 @@ func (t *Tunnel) tunReader() {
 				if !enqueueWithTimeout(t.sendQueue, packet, t.stopCh) {
 					select {
 					case <-t.stopCh:
-						t.releasePacketBuffer(packet)
+						t.releasePacketBuffer(buf)
 						return
 					default:
 						log.Printf("Send queue full after timeout, dropping packet")
 					}
-					t.releasePacketBuffer(packet)
+					t.releasePacketBuffer(buf)
 				}
 			}
 		}
@@ -938,6 +947,7 @@ func (t *Tunnel) tunReaderServer() {
 		}
 
 		buf := t.getPacketBuffer()
+		// Leave one byte headroom so prependPacketType can reuse the buffer without reallocating.
 		readBuf := buf[:t.packetBufSize-1]
 		n, err := t.tunFile.Read(readBuf)
 		if err != nil {
@@ -962,7 +972,7 @@ func (t *Tunnel) tunReaderServer() {
 		// IP header: version(4 bits) + IHL(4 bits) + ... + dst IP (4 bytes starting at offset 16 for IPv4)
 		if packet[0]>>4 != IPv4Version {
 			// Not IPv4, skip
-			t.releasePacketBuffer(packet)
+			t.releasePacketBuffer(buf)
 			continue
 		}
 
@@ -985,18 +995,18 @@ func (t *Tunnel) tunReaderServer() {
 			select {
 			case client.sendQueue <- packet:
 			case <-t.stopCh:
-				t.releasePacketBuffer(packet)
+				t.releasePacketBuffer(buf)
 				return
 			case <-time.After(QueueSendTimeout):
 				// Wait for queue space before logging and dropping
 				select {
 				case client.sendQueue <- packet:
 				case <-t.stopCh:
-					t.releasePacketBuffer(packet)
+					t.releasePacketBuffer(buf)
 					return
 				default:
 					log.Printf("⚠️  Client send queue full for %s after timeout, dropping packet", dstIP)
-					t.releasePacketBuffer(packet)
+					t.releasePacketBuffer(buf)
 				}
 			}
 		} else {
@@ -1005,21 +1015,21 @@ func (t *Tunnel) tunReaderServer() {
 				select {
 				case routeClient.sendQueue <- packet:
 				case <-t.stopCh:
-					t.releasePacketBuffer(packet)
+					t.releasePacketBuffer(buf)
 					return
 				case <-time.After(QueueSendTimeout):
 					select {
 					case routeClient.sendQueue <- packet:
 					case <-t.stopCh:
-						t.releasePacketBuffer(packet)
+						t.releasePacketBuffer(buf)
 						return
 					default:
 						log.Printf("⚠️  Route client queue full for %s after timeout, dropping packet", dstIP)
-						t.releasePacketBuffer(packet)
+						t.releasePacketBuffer(buf)
 					}
 				}
 			} else {
-				t.releasePacketBuffer(packet)
+				t.releasePacketBuffer(buf)
 			}
 		}
 		// If no client found, packet is dropped
