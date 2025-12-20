@@ -2530,7 +2530,6 @@ func (t *Tunnel) deactivatePrevCipher(prev *crypto.Cipher, reason string) {
 	}
 
 	t.cipherMux.Lock()
-	prevGen := t.prevCipherGen
 	if t.prevCipher != prev {
 		t.cipherMux.Unlock()
 		return
@@ -2539,22 +2538,6 @@ func (t *Tunnel) deactivatePrevCipher(prev *crypto.Cipher, reason string) {
 	t.prevCipherGen = 0
 	t.prevCipherExp = time.Time{}
 	t.cipherMux.Unlock()
-
-	t.allClientsMux.RLock()
-	clients := make([]*ClientConnection, 0, len(t.allClients))
-	for client := range t.allClients {
-		clients = append(clients, client)
-	}
-	t.allClientsMux.RUnlock()
-
-	for _, client := range clients {
-		if _, gen := client.getCipher(); gen != 0 && gen == prevGen {
-			client.stopOnce.Do(func() {
-				_ = client.conn.Close()
-				close(client.stopCh)
-			})
-		}
-	}
 
 	log.Printf("Deactivated previous cipher (%s)", reason)
 }
