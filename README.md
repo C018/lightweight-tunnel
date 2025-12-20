@@ -535,6 +535,35 @@ sudo ./lightweight-tunnel -c config-client.json
         显示版本信息
 ```
 
+FEC 参数说明：
+
+- **CLI 参数**:
+  - `--fec-data`：数据分片数量（默认：10）。表示每个数据包被切分为多少个数据分片。
+  - `--fec-parity`：校验分片数量（默认：3）。表示用于纠错的校验分片数。
+
+- **配置字段**:
+  - `FECDataShards`：等同于 `--fec-data`。
+  - `FECParityShards`：等同于 `--fec-parity`。
+
+- **工作原理与权衡**：
+  - 总分片数 = `data + parity`；最多可以恢复丢失的 `parity` 个分片。
+  - 例如：默认值 `10` data + `3` parity → 总 13 个分片，可恢复最多 3/13 ≈ 23% 的丢包率。
+  - 增加 `fec-parity` 会提升丢包恢复能力，但带来额外带宽和编码/解码 CPU 开销。
+
+- **有效性与限制**：
+  - 要求 `FECDataShards >= 1` 且 `FECParityShards >= 1`，否则程序会返回错误。
+  - 选择参数时，请根据网络丢包率和带宽/CPU 预算进行平衡测试。
+
+- **示例（命令行）**：
+  - `lightweight-tunnel --fec-data=10 --fec-parity=3`
+
+- **示例（JSON 配置）**：
+```json
+{
+  "FECDataShards": 10,
+  "FECParityShards": 3
+}
+
 ### 高级功能
 
 #### 动态密钥轮换
