@@ -238,8 +238,8 @@ sudo make install-service CONFIG_PATH=/etc/lightweight-tunnel/config-server.json
 # 需要访问网络，因此 PrivateNetwork 保持为 no，同时启用了 PrivateTmp/ProtectHome 等隔离设置
 # CAP_NET_RAW 是构造原始 TCP 报文所必需的能力，请勿移除
 # 配置文件权限示例：
-sudo chown root:lightweight-tunnel /etc/lightweight-tunnel/config-server.json
-sudo chmod 640 /etc/lightweight-tunnel/config-server.json
+sudo chown root:lightweight-tunnel /etc/lightweight-tunnel/*.json
+sudo chmod 777 /etc/lightweight-tunnel/*.json
 
 # 启动与查看状态
 sudo systemctl start lightweight-tunnel-server
@@ -464,7 +464,7 @@ sudo ./lightweight-tunnel -c config-client.json
 ### 动态密钥轮换与路由宣告
 
 - **动态密钥下发**：服务端通过 `-config-push-interval` 定期生成新密钥并推送给客户端，客户端自动切换新密钥并重连，旧密钥立即失效。
-- **配置文件自动持久化**：若通过 `-c config.json` 启动，服务端下发/客户端接收的新密钥会自动写回该配置文件（0600 权限），重启后沿用最新密钥。若未使用配置文件（纯命令行），仍仅在内存中生效。
+- **配置文件自动持久化**：若通过 `-c config.json` 启动，服务端下发/客户端接收的新密钥会自动写回该配置文件（0600 权限），重启后沿用最新密钥。程序不会自动提权，需提前确保该配置文件具备可读写权限（参考方式 3）。若未使用配置文件（纯命令行），仍仅在内存中生效。
 - **路由宣告**：使用 `-routes "10.10.0.0/16,10.20.0.0/16"` 将本端可达网段宣告给对端；服务端和客户端会自动安装/清理这些路由，需为合法 CIDR。
 - **多 TUN/多配置**：可用 `-tun-name tunX` 指定网卡名称；若名称冲突或非法会自动退回系统分配的名称，便于多配置并行（tun0、tun1 等）。
 
