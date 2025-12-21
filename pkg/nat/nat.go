@@ -114,9 +114,21 @@ func NewDetector(testPort int, timeout time.Duration) *Detector {
 }
 
 // DetectNATType attempts to detect the NAT type
-// This is a simplified detection that uses basic UDP socket behavior
+// Uses STUN protocol (RFC 5389) for reliable detection when possible
 func (d *Detector) DetectNATType(serverAddr string) (NATType, error) {
-	// Step 1: Try to detect if we have a public IP (no NAT)
+	// Step 1: Try STUN-based detection first (most reliable)
+	if serverAddr != "" {
+		natType, err := d.detectWithSTUN(serverAddr)
+		if err != nil {
+			log.Printf("STUN detection failed, falling back to simple detection: %v", err)
+		} else {
+			log.Printf("STUN-based NAT detection successful: %s", natType)
+			return natType, nil
+		}
+	}
+
+	// Step 2: Fallback to local detection if STUN unavailable
+	// Try to detect if we have a public IP (no NAT)
 	hasPublicIP, err := d.hasPublicIP()
 	if err != nil {
 		log.Printf("Failed to check for public IP: %v", err)
@@ -125,25 +137,46 @@ func (d *Detector) DetectNATType(serverAddr string) (NATType, error) {
 		return NATNone, nil
 	}
 
-	// Step 2: Test for symmetric NAT by checking if port changes per destination
-	// This requires connecting to multiple servers, which we'll simplify
-	// For now, we'll use a heuristic based on socket binding behavior
-
-	// Create two UDP connections to different destinations
+	// Step 3: Test for symmetric NAT by checking if port changes per destination
 	isSymmetric, err := d.testSymmetricNAT(serverAddr)
 	if err != nil {
 		log.Printf("Failed to test for symmetric NAT: %v", err)
 		// Continue with other tests
 	} else if isSymmetric {
-		log.Println("Detected Symmetric NAT")
+		log.Println("Detected Symmetric NAT (local test)")
 		return NATSymmetric, nil
 	}
 
-	// Step 3: If not symmetric, it's some type of cone NAT
+	// Step 4: If not symmetric, it's some type of cone NAT
 	// Without external STUN servers, we'll default to Port-Restricted Cone
 	// which is the most common type and a safe middle ground
 	log.Println("Detected Cone NAT (likely Port-Restricted)")
 	return NATPortRestrictedCone, nil
+}
+
+// detectWithSTUN performs NAT detection using STUN protocol
+func (d *Detector) detectWithSTUN(serverAddr string) (NATType, error) {
+	// Try multiple STUN servers for better reliability
+	stunServers := []string{
+		serverAddr,
+		"stun.l.google.com:19302",
+		"stun1.l.google.com:19302",
+		"stun2.l.google.com:19302",
+	}
+
+	var lastErr error
+	for _, server := range stunServers {
+		client := NewSTUNClient(server, d.testTimeout)
+		natType, err := client.DetectNATTypeWithSTUN()
+		if err == nil {
+			log.Printf("Successfully detected NAT type using STUN server %s: %s", server, natType)
+			return natType, nil
+		}
+		lastErr = err
+		log.Printf("STUN detection failed with server %s: %v", server, err)
+	}
+
+	return NATUnknown, fmt.Errorf("all STUN servers failed, last error: %v", lastErr)
 }
 
 // hasPublicIP checks if the local address is a public IP
@@ -193,29 +226,45 @@ func isPrivateIP(ip net.IP) bool {
 	return false
 }
 
-// bytesInRange checks if ip is between start and end
+// bytesInRange checks if ip is between start and end (inclusive)
 func bytesInRange(ip, start, end net.IP) bool {
 	if len(ip) != len(start) || len(ip) != len(end) {
 		return false
 	}
 
-	// Check each byte: IP must be >= start and <= end
+	// Single pass comparison: check both bounds simultaneously
 	for i := range ip {
+		// If IP byte is less than start byte at this position, IP < start
 		if ip[i] < start[i] {
 			return false
 		}
+		// If IP byte is greater than start byte, IP is definitely >= start
+		// Now only need to check upper bound
+		if ip[i] > start[i] {
+			// Check remaining bytes against end
+			for j := i; j < len(ip); j++ {
+				if ip[j] > end[j] {
+					return false
+				}
+				if ip[j] < end[j] {
+					return true
+				}
+			}
+			return true // IP == end for remaining bytes
+		}
+		// If ip[i] == start[i], continue checking next byte
+	}
+	
+	// All bytes equal to start, so IP == start. Now verify IP <= end
+	for i := range ip {
 		if ip[i] > end[i] {
 			return false
 		}
-		// If this byte is within the range but not equal to start/end,
-		// then the IP is strictly within range and we can return true
-		if ip[i] > start[i] && ip[i] < end[i] {
+		if ip[i] < end[i] {
 			return true
 		}
 	}
-
-	// All bytes matched exactly or are at boundaries
-	return true
+	return true // IP == start == end
 }
 
 // testSymmetricNAT tests if the NAT is symmetric by checking port binding behavior
@@ -243,8 +292,8 @@ func (d *Detector) testSymmetricNAT(serverAddr string) (bool, error) {
 	testConn, err := net.ListenUDP("udp4", testAddr)
 	if err != nil {
 		// If we can't bind to the same port, might indicate symmetric behavior
-		// but could also be port already in use
-		return false, nil // Conservative: assume non-symmetric
+		// This suggests the NAT is holding the port mapping exclusively
+		return true, nil // Likely symmetric
 	}
 	testConn.Close()
 
