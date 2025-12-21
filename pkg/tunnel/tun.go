@@ -3,6 +3,7 @@ package tunnel
 import (
 	"fmt"
 	"os"
+	"sync/atomic"
 	"syscall"
 	"unsafe"
 )
@@ -17,9 +18,10 @@ const (
 
 // TunDevice represents a TUN network device
 type TunDevice struct {
-	file *os.File
-	fd   int
-	name string
+	file   *os.File
+	fd     int
+	name   string
+	closed int32 // atomic flag to track if device is closed
 }
 
 // ifreq structure for ioctl calls
@@ -33,7 +35,7 @@ type ifreq struct {
 func CreateTUN(name string) (*TunDevice, error) {
 	// Open TUN device using syscall to avoid Go's runtime poller
 	// This prevents "not pollable" errors on some systems/kernels
-	fd, err := syscall.Open("/dev/net/tun", syscall.O_RDWR, 0)
+	fd, err := syscall.Open("/dev/net/tun", syscall.O_RDWR|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open /dev/net/tun: %v", err)
 	}
@@ -64,17 +66,36 @@ func CreateTUN(name string) (*TunDevice, error) {
 	}
 
 	return &TunDevice{
-		file: file,
-		fd:   fd,
-		name: actualName,
+		file:   file,
+		fd:     fd,
+		name:   actualName,
+		closed: 0,
 	}, nil
 }
 
 // Read reads a packet from the TUN device
 func (t *TunDevice) Read(buf []byte) (int, error) {
+	// Check if device is already closed
+	if atomic.LoadInt32(&t.closed) != 0 {
+		return 0, syscall.EBADF
+	}
+	
 	for {
 		n, err := syscall.Read(t.fd, buf)
 		if err == syscall.EINTR {
+			// Check again if device was closed while we were interrupted
+			if atomic.LoadInt32(&t.closed) != 0 {
+				return 0, syscall.EBADF
+			}
+			continue
+		}
+		if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
+			// Non-blocking read would block, check if closed and retry with a small sleep
+			if atomic.LoadInt32(&t.closed) != 0 {
+				return 0, syscall.EBADF
+			}
+			// Sleep briefly to avoid busy-wait
+			syscall.Select(0, nil, nil, nil, &syscall.Timeval{Usec: 10000}) // 10ms
 			continue
 		}
 		return n, err
@@ -83,9 +104,27 @@ func (t *TunDevice) Read(buf []byte) (int, error) {
 
 // Write writes a packet to the TUN device
 func (t *TunDevice) Write(buf []byte) (int, error) {
+	// Check if device is already closed
+	if atomic.LoadInt32(&t.closed) != 0 {
+		return 0, syscall.EBADF
+	}
+	
 	for {
 		n, err := syscall.Write(t.fd, buf)
 		if err == syscall.EINTR {
+			// Check again if device was closed while we were interrupted
+			if atomic.LoadInt32(&t.closed) != 0 {
+				return 0, syscall.EBADF
+			}
+			continue
+		}
+		if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
+			// Non-blocking write would block, check if closed and retry with a small sleep
+			if atomic.LoadInt32(&t.closed) != 0 {
+				return 0, syscall.EBADF
+			}
+			// Sleep briefly to avoid busy-wait
+			syscall.Select(0, nil, nil, nil, &syscall.Timeval{Usec: 10000}) // 10ms
 			continue
 		}
 		return n, err
@@ -94,6 +133,13 @@ func (t *TunDevice) Write(buf []byte) (int, error) {
 
 // Close closes the TUN device
 func (t *TunDevice) Close() error {
+	// Mark as closed atomically
+	if !atomic.CompareAndSwapInt32(&t.closed, 0, 1) {
+		// Already closed
+		return nil
+	}
+	
+	// Close the file descriptor - this will unblock any pending Read/Write
 	return t.file.Close()
 }
 
