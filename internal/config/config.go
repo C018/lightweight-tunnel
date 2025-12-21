@@ -39,6 +39,10 @@ type Config struct {
 	EnableNATDetection  bool `json:"enable_nat_detection"`  // Enable automatic NAT type detection (default true)
 	EnableXDP           bool `json:"enable_xdp"`            // Enable lightweight XDP/eBPF fast-path classification
 	EnableKernelTune    bool `json:"enable_kernel_tune"`    // Apply kernel tunings (TFO/BBR2) on startup
+
+	// On-demand P2P configuration
+	RouteAdvertInterval  int `json:"route_advert_interval"`  // Route advertisement interval in seconds (default 300)
+	P2PKeepAliveInterval int `json:"p2p_keepalive_interval"` // P2P keepalive interval in seconds (default 25)
 }
 
 // DefaultConfig returns a default configuration
@@ -67,10 +71,12 @@ func DefaultConfig() *Config {
 		EnableMeshRouting:   true,
 		MaxHops:             3,
 		RouteUpdateInterval: 30,
-		P2PTimeout:          5,
-		EnableNATDetection:  true,
-		EnableXDP:           true,
-		EnableKernelTune:    true,
+		P2PTimeout:           5,
+		EnableNATDetection:   true,
+		EnableXDP:            true,
+		EnableKernelTune:     true,
+		RouteAdvertInterval:  300, // 5 minutes
+		P2PKeepAliveInterval: 25,  // 25 seconds
 	}
 }
 
@@ -125,6 +131,12 @@ func LoadConfig(filename string) (*Config, error) {
 	}
 	if config.P2PTimeout == 0 {
 		config.P2PTimeout = 5
+	}
+	if config.RouteAdvertInterval == 0 {
+		config.RouteAdvertInterval = 300
+	}
+	if config.P2PKeepAliveInterval == 0 {
+		config.P2PKeepAliveInterval = 25
 	}
 
 	// Default multi_client to true for server mode if not explicitly set
