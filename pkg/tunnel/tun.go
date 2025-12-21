@@ -38,9 +38,10 @@ type ifreq struct {
 
 // CreateTUN creates a new TUN device
 func CreateTUN(name string) (*TunDevice, error) {
-	// Open TUN device using syscall to avoid Go's runtime poller
-	// This prevents "not pollable" errors on some systems/kernels
-	fd, err := syscall.Open("/dev/net/tun", syscall.O_RDWR|syscall.O_NONBLOCK, 0)
+	// Open TUN device in blocking mode using syscall to avoid Go's runtime poller.
+	// Blocking I/O ensures packets are delivered immediately without the sleep-based
+	// polling overhead that would add per-packet latency.
+	fd, err := syscall.Open("/dev/net/tun", syscall.O_RDWR, 0)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open /dev/net/tun: %v", err)
 	}
