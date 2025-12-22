@@ -6,43 +6,49 @@ import (
 )
 
 // TestGetPeerIPDerivesServerAddress verifies that GetPeerIP correctly
-// derives the server's tunnel IP from a client's tunnel address
+// derives the peer's tunnel IP from a given tunnel address.
+// In client mode, this peer IP is the server's IP address.
 func TestGetPeerIPDerivesServerAddress(t *testing.T) {
 	tests := []struct {
-		name             string
-		clientTunnelAddr string
-		expectedServerIP string
-		expectError      bool
+		name           string
+		tunnelAddr     string
+		expectedPeerIP string
+		expectError    bool
+		description    string
 	}{
 		{
-			name:             "client .2 derives server .1",
-			clientTunnelAddr: "10.0.0.2/24",
-			expectedServerIP: "10.0.0.1",
-			expectError:      false,
+			name:           "client .2 derives peer .1",
+			tunnelAddr:     "10.0.0.2/24",
+			expectedPeerIP: "10.0.0.1",
+			expectError:    false,
+			description:    "When client is .2, peer (server) is .1",
 		},
 		{
-			name:             "client .1 derives server .2",
-			clientTunnelAddr: "10.0.0.1/24",
-			expectedServerIP: "10.0.0.2",
-			expectError:      false,
+			name:           "client .1 derives peer .2",
+			tunnelAddr:     "10.0.0.1/24",
+			expectedPeerIP: "10.0.0.2",
+			expectError:    false,
+			description:    "When client is .1, peer (server) is .2",
 		},
 		{
-			name:             "client .10 derives server .1",
-			clientTunnelAddr: "10.0.0.10/24",
-			expectedServerIP: "10.0.0.1",
-			expectError:      false,
+			name:           "client .10 derives peer .1",
+			tunnelAddr:     "10.0.0.10/24",
+			expectedPeerIP: "10.0.0.1",
+			expectError:    false,
+			description:    "When client is .10, peer (server) is .1",
 		},
 		{
-			name:             "client .100 derives server .1",
-			clientTunnelAddr: "192.168.1.100/24",
-			expectedServerIP: "192.168.1.1",
-			expectError:      false,
+			name:           "client .100 derives peer .1",
+			tunnelAddr:     "192.168.1.100/24",
+			expectedPeerIP: "192.168.1.1",
+			expectError:    false,
+			description:    "When client is .100, peer (server) is .1",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			serverAddr, err := GetPeerIP(tt.clientTunnelAddr)
+			peerAddr, err := GetPeerIP(tt.tunnelAddr)
 			if tt.expectError {
 				if err == nil {
 					t.Error("Expected error but got none")
@@ -54,18 +60,18 @@ func TestGetPeerIPDerivesServerAddress(t *testing.T) {
 			}
 
 			// Extract IP from CIDR
-			ip, _, err := net.ParseCIDR(serverAddr)
+			ip, _, err := net.ParseCIDR(peerAddr)
 			if err != nil {
-				t.Fatalf("Failed to parse returned address %s: %v", serverAddr, err)
+				t.Fatalf("Failed to parse returned address %s: %v", peerAddr, err)
 			}
 
-			expectedIP := net.ParseIP(tt.expectedServerIP)
+			expectedIP := net.ParseIP(tt.expectedPeerIP)
 			if !ip.Equal(expectedIP) {
-				t.Errorf("Expected server IP to be %s, got %s", tt.expectedServerIP, ip)
+				t.Errorf("Expected peer IP to be %s, got %s", tt.expectedPeerIP, ip)
 			}
 
-			t.Logf("Successfully derived server IP %s from client address %s", 
-				ip, tt.clientTunnelAddr)
+			t.Logf("%s: Successfully derived peer IP %s from address %s", 
+				tt.description, ip, tt.tunnelAddr)
 		})
 	}
 }
@@ -92,4 +98,3 @@ func TestServerIPRoutingLogic(t *testing.T) {
 	t.Log("  - Client -> Client: Try P2P first, fallback to server relay")
 	t.Log("  - No more 'P2P request for unknown target' errors for server IP")
 }
-
