@@ -253,7 +253,7 @@ sudo make install-service \
 # 配置文件权限（示例）
 sudo mkdir -p /etc/lightweight-tunnel
 sudo chown root:lightweight-tunnel /etc/lightweight-tunnel/*.json
-sudo chmod 640 /etc/lightweight-tunnel/*.json
+sudo chmod 600 /etc/lightweight-tunnel/*.json  # 仅 root 可读写
 
 # 启动服务
 sudo systemctl start lightweight-tunnel-server
@@ -577,7 +577,7 @@ sudo ./lightweight-tunnel \
   -tun-name mytun0
 ```
 
-> 💡 如果名称冲突或非法，会退回系统自动分配。
+> 💡 如果名称冲突或非法，会回退到系统自动分配。
 
 ---
 
@@ -1091,14 +1091,7 @@ go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
 
 本项目采用 [MIT License](LICENSE) 开源协议。
 
-```
-MIT License
-Copyright (c) 2024 openbmx
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction...
-```
+详细协议内容请查看 [LICENSE](LICENSE) 文件。
 
 ---
 
