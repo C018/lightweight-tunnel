@@ -211,7 +211,7 @@ type Tunnel struct {
 	// FEC state tracking
 	fecEnabled       bool
 	fecSessionID     uint32                      // Current FEC session ID for sending
-	fecRecvSessions  map[uint32]*fecRecvSession  // FEC receive sessions (session ID -> session)
+	fecRecvSessions  map[string]*fecRecvSession  // FEC receive sessions (key: "peerAddr:sessionID" -> session)
 	fecRecvMux       sync.Mutex                  // Protects fecRecvSessions
 	fecCleanupTicker *time.Ticker                // Ticker for cleaning up stale FEC sessions
 
@@ -382,8 +382,8 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 		xdpAccel:           accel,
 		pendingP2PRequests: make(map[string]time.Time),
 		fecEnabled:         cfg.FECDataShards > 0 && cfg.FECParityShards > 0,
-		fecRecvSessions:    make(map[uint32]*fecRecvSession),
-		fecSessionID:       1,
+		fecRecvSessions:    make(map[string]*fecRecvSession),
+		fecSessionID:       uint32(time.Now().UnixNano()),
 	}
 	t.packetPool = &sync.Pool{
 		New: func() any {
@@ -1451,7 +1451,7 @@ func (t *Tunnel) netReader() {
 		// FEC shards are NOT encrypted themselves - they contain pieces of encrypted data
 		if len(packet) > 0 && packet[0] == PacketTypeFECShard {
 			if t.fecEnabled {
-				reconstructedPacket, err := t.processFECShard(packet[1:])
+				reconstructedPacket, err := t.processFECShard(t.config.RemoteAddr, packet[1:])
 				if err != nil {
 					log.Printf("FEC shard processing error: %v", err)
 					continue
@@ -1817,7 +1817,7 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 		// FEC shards are NOT encrypted themselves - they contain pieces of encrypted data
 		if len(packet) > 0 && packet[0] == PacketTypeFECShard {
 			if t.fecEnabled {
-				reconstructedPacket, err := t.processFECShard(packet[1:])
+				reconstructedPacket, err := t.processFECShard(client.conn.RemoteAddr().String(), packet[1:])
 				if err != nil {
 					log.Printf("FEC shard processing error from client %s: %v", client.conn.RemoteAddr(), err)
 					continue
@@ -3839,7 +3839,7 @@ func (t *Tunnel) sendPacketWithFEC(conn faketcp.ConnAdapter, packet []byte) erro
 
 // processFECShard handles a received FEC shard and attempts to reconstruct the original packet
 // Returns the reconstructed packet if complete, or nil if more shards are needed
-func (t *Tunnel) processFECShard(fecPacket []byte) ([]byte, error) {
+func (t *Tunnel) processFECShard(peerAddr string, fecPacket []byte) ([]byte, error) {
 	// FEC header: sessionID(4) + shardIndex(2) + totalShards(2) + originalSize(4) = 12 bytes minimum
 	if len(fecPacket) < 12 {
 		return nil, errors.New("FEC packet too short")
@@ -3851,6 +3851,9 @@ func (t *Tunnel) processFECShard(fecPacket []byte) ([]byte, error) {
 	totalShards := int(fecPacket[6])<<8 | int(fecPacket[7])
 	originalSize := int(fecPacket[8])<<24 | int(fecPacket[9])<<16 | int(fecPacket[10])<<8 | int(fecPacket[11])
 	shardData := fecPacket[12:]
+	
+	// Create unique session key using peer address and session ID
+	sessionKey := fmt.Sprintf("%s:%d", peerAddr, sessionID)
 	
 	// Validate
 	if totalShards != t.fec.TotalShards() {
@@ -3875,7 +3878,7 @@ func (t *Tunnel) processFECShard(fecPacket []byte) ([]byte, error) {
 	
 	// Get or create FEC session
 	t.fecRecvMux.Lock()
-	session, exists := t.fecRecvSessions[sessionID]
+	session, exists := t.fecRecvSessions[sessionKey]
 	if !exists {
 		// Create new session
 		session = &fecRecvSession{
@@ -3888,13 +3891,13 @@ func (t *Tunnel) processFECShard(fecPacket []byte) ([]byte, error) {
 			lastUpdate:    time.Now(),
 			originalSize:  originalSize,
 		}
-		t.fecRecvSessions[sessionID] = session
+		t.fecRecvSessions[sessionKey] = session
 	}
 	
 	// Validate shard consistency
 	if session.originalSize != originalSize {
 		t.fecRecvMux.Unlock()
-		return nil, fmt.Errorf("FEC session %d: original size mismatch (%d vs %d)", sessionID, session.originalSize, originalSize)
+		return nil, fmt.Errorf("FEC session %s: original size mismatch (%d vs %d)", sessionKey, session.originalSize, originalSize)
 	}
 	
 	t.fecRecvMux.Unlock()
@@ -3923,7 +3926,7 @@ func (t *Tunnel) processFECShard(fecPacket []byte) ([]byte, error) {
 		
 		// Clean up session
 		t.fecRecvMux.Lock()
-		delete(t.fecRecvSessions, sessionID)
+		delete(t.fecRecvSessions, sessionKey)
 		t.fecRecvMux.Unlock()
 		
 		return decodedData, nil
@@ -3941,9 +3944,9 @@ func (t *Tunnel) cleanupStaleFECSessions() {
 	defer t.fecRecvMux.Unlock()
 	
 	now := time.Now()
-	for sessionID, session := range t.fecRecvSessions {
+	for sessionKey, session := range t.fecRecvSessions {
 		if now.Sub(session.lastUpdate) > sessionTimeout {
-			delete(t.fecRecvSessions, sessionID)
+			delete(t.fecRecvSessions, sessionKey)
 		}
 	}
 }
