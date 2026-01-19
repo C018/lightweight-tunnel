@@ -845,7 +845,8 @@ func (t *Tunnel) performClientAuthentication() error {
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		if attempt > 0 {
 			log.Printf("Authentication attempt %d/%d...", attempt+1, maxRetries)
-			// Wait before retry with exponential backoff
+			// Wait before retry with exponential backoff: 1s, 2s, 4s
+			// Formula: 2^(attempt-1) seconds
 			backoff := time.Duration(1<<uint(attempt-1)) * time.Second
 			time.Sleep(backoff)
 		}
@@ -897,11 +898,18 @@ func (t *Tunnel) performClientAuthentication() error {
 		case err := <-t.authResponseChan:
 			if err != nil {
 				lastErr = err
+				errMsg := err.Error()
 				log.Printf("⚠️  Authentication rejected: %v", err)
-				// Check if it's a key mismatch (permanent error)
-				if strings.Contains(err.Error(), "INVALID") || strings.Contains(err.Error(), "wrong key") {
+				// Check if it's a permanent error (key mismatch) vs transient error
+				// Permanent errors: INVALID response, decryption errors, wrong key
+				// These indicate a configuration problem that won't be fixed by retrying
+				if strings.Contains(errMsg, "INVALID") || 
+				   strings.Contains(errMsg, "wrong key") ||
+				   strings.Contains(errMsg, "decryption") ||
+				   strings.Contains(errMsg, "cipher") {
 					return fmt.Errorf("authentication failed: incorrect encryption key - please verify both client and server use the same key")
 				}
+				// For other errors (like EXPIRED timestamp), retry may help
 				continue
 			}
 			// Authentication successful
