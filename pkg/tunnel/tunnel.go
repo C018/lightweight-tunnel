@@ -492,6 +492,18 @@ func (t *Tunnel) Start() error {
 			return fmt.Errorf("failed to connect as client: %v", err)
 		}
 
+		netReaderStarted := false
+		if t.config.EncryptAfterAuth && t.cipher != nil {
+			t.wg.Add(1)
+			go t.netReader()
+			netReaderStarted = true
+			if err := t.performClientAuthentication(); err != nil {
+				t.Stop()
+				return fmt.Errorf("failed to authenticate: %v", err)
+			}
+			log.Printf("✅ Authentication successful - data packets will not be encrypted")
+		}
+
 		// Start P2P manager if enabled
 		if t.config.P2PEnabled && t.p2pManager != nil {
 			if err := t.p2pManager.Start(); err != nil {
@@ -512,11 +524,18 @@ func (t *Tunnel) Start() error {
 		}
 
 		// Start client mode packet processing
-		t.wg.Add(4)
-		go t.tunReader()
-		go t.tunWriter()
-		go t.netReader()
-		go t.netWriter()
+		if netReaderStarted {
+			t.wg.Add(3)
+			go t.tunReader()
+			go t.tunWriter()
+			go t.netWriter()
+		} else {
+			t.wg.Add(4)
+			go t.tunReader()
+			go t.tunWriter()
+			go t.netReader()
+			go t.netWriter()
+		}
 
 		// Start keepalive
 		t.wg.Add(1)
@@ -817,16 +836,7 @@ func (t *Tunnel) connectClient() error {
 
 	t.conn = conn
 	log.Printf("Connected to server: %s -> %s", conn.LocalAddr(), conn.RemoteAddr())
-	
-	// Perform authentication handshake if encrypt_after_auth mode is enabled
-	if t.config.EncryptAfterAuth && t.cipher != nil {
-		if err := t.performClientAuthentication(); err != nil {
-			conn.Close()
-			return fmt.Errorf("authentication failed: %v", err)
-		}
-		log.Printf("✅ Authentication successful - data packets will not be encrypted")
-	}
-	
+
 	return nil
 }
 
