@@ -63,6 +63,10 @@ const (
 	// Set to 3x the keepalive interval to allow for some packet loss and network jitter.
 	IdleConnectionTimeout = 15 * time.Second // 3x default keepalive (5s)
 
+	// Authentication constants
+	AuthenticationTimeout     = 5 * time.Second  // Timeout for authentication handshake
+	AuthenticationTimeWindow  = 300              // Authentication timestamp validity window in seconds (5 minutes)
+
 	// Rotation and advertisement timing
 	KeyRotationGracePeriod     = 15 * time.Second
 	DefaultRouteAdvertInterval = 60 * time.Second
@@ -320,7 +324,15 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to create encryption cipher: %v", err)
 		}
-		log.Println("Encryption enabled with AES-256-GCM")
+		
+		if cfg.EncryptAfterAuth {
+			log.Println("✅ Authentication-only mode enabled (encrypt_after_auth=true)")
+			log.Println("   - Data packets will NOT be encrypted after authentication")
+			log.Println("   - Control packets will remain encrypted for security")
+			log.Println("   - Lower CPU overhead, faster data transmission")
+		} else {
+			log.Println("Encryption enabled with AES-256-GCM")
+		}
 
 		// Adjust MTU to prevent TCP segmentation of encrypted packets in raw TCP mode
 		// In raw TCP mode, WritePacket segments data into 1400-byte chunks.
@@ -811,13 +823,29 @@ func (t *Tunnel) connectClient() error {
 	return nil
 }
 
+// AuthenticationRequest represents the authentication request payload
+type AuthenticationRequest struct {
+	Timestamp int64  `json:"timestamp"` // Unix timestamp for replay attack prevention
+	TunnelIP  string `json:"tunnel_ip"` // Client's tunnel IP address
+}
+
 // performClientAuthentication performs the authentication handshake with server
 func (t *Tunnel) performClientAuthentication() error {
-	// Create authentication packet with timestamp and tunnel IP
-	authData := fmt.Sprintf("%d|%s", time.Now().Unix(), t.myTunnelIP.String())
+	// Create authentication request
+	authReq := AuthenticationRequest{
+		Timestamp: time.Now().Unix(),
+		TunnelIP:  t.myTunnelIP.String(),
+	}
+	
+	// Marshal to JSON
+	authData, err := json.Marshal(authReq)
+	if err != nil {
+		return fmt.Errorf("failed to marshal auth request: %v", err)
+	}
+	
 	authPacket := make([]byte, len(authData)+1)
 	authPacket[0] = PacketTypeAuth
-	copy(authPacket[1:], []byte(authData))
+	copy(authPacket[1:], authData)
 	
 	// Encrypt the authentication packet (always encrypted for security)
 	t.cipherMux.RLock()
@@ -887,7 +915,7 @@ func (t *Tunnel) performClientAuthentication() error {
 		t.authenticated = true
 		t.authMux.Unlock()
 		return nil
-	case <-time.After(5 * time.Second):
+	case <-time.After(AuthenticationTimeout):
 		return fmt.Errorf("authentication timeout")
 	}
 }
@@ -1362,9 +1390,18 @@ func (t *Tunnel) netReader() {
 				t.authMux.Unlock()
 				
 				if err := t.performClientAuthentication(); err != nil {
-					log.Printf("Re-authentication failed after reconnect: %v", err)
-					// Continue anyway, will retry on next reconnect
+					log.Printf("❌ Re-authentication failed after reconnect: %v", err)
+					log.Printf("Connection will close, please check your encryption key")
+					// Close the connection and exit to force a full reconnection attempt
+					t.connMux.Lock()
+					if t.conn != nil {
+						_ = t.conn.Close()
+						t.conn = nil
+					}
+					t.connMux.Unlock()
+					return
 				}
+				log.Printf("✅ Re-authentication successful after reconnect")
 			}
 
 			log.Printf("Reconnection successful, resuming packet reception")
@@ -3138,35 +3175,26 @@ func (t *Tunnel) expirePrevCipher(prev *crypto.Cipher) {
 
 // handleClientAuthentication handles authentication request from client (server mode)
 func (t *Tunnel) handleClientAuthentication(client *ClientConnection, payload []byte) {
-	// Parse authentication data
-	authData := string(payload)
-	parts := strings.Split(authData, "|")
-	if len(parts) != 2 {
-		log.Printf("Invalid authentication request from %s: malformed data", client.conn.RemoteAddr())
+	// Parse authentication request
+	var authReq AuthenticationRequest
+	if err := json.Unmarshal(payload, &authReq); err != nil {
+		log.Printf("Invalid authentication request from %s: failed to parse JSON: %v", client.conn.RemoteAddr(), err)
 		t.sendAuthResponse(client, "INVALID")
 		return
 	}
 	
 	// Validate timestamp (prevent replay attacks)
-	timestamp, err := strconv.ParseInt(parts[0], 10, 64)
-	if err != nil {
-		log.Printf("Invalid authentication request from %s: bad timestamp", client.conn.RemoteAddr())
-		t.sendAuthResponse(client, "INVALID")
-		return
-	}
-	
-	// Check if timestamp is within acceptable window (5 minutes)
 	now := time.Now().Unix()
-	if now-timestamp > 300 || timestamp-now > 300 {
+	if now-authReq.Timestamp > AuthenticationTimeWindow || authReq.Timestamp-now > AuthenticationTimeWindow {
 		log.Printf("Authentication request from %s rejected: timestamp out of range", client.conn.RemoteAddr())
 		t.sendAuthResponse(client, "EXPIRED")
 		return
 	}
 	
-	// Extract tunnel IP
-	tunnelIP := net.ParseIP(parts[1])
+	// Validate tunnel IP
+	tunnelIP := net.ParseIP(authReq.TunnelIP)
 	if tunnelIP == nil {
-		log.Printf("Invalid authentication request from %s: bad IP", client.conn.RemoteAddr())
+		log.Printf("Invalid authentication request from %s: bad IP %s", client.conn.RemoteAddr(), authReq.TunnelIP)
 		t.sendAuthResponse(client, "INVALID")
 		return
 	}
