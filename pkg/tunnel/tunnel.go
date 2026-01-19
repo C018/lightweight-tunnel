@@ -414,6 +414,10 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 	if cfg.Mode == "client" {
 		t.sendQueue = make(chan []byte, cfg.SendQueueSize)
 		t.recvQueue = make(chan []byte, cfg.RecvQueueSize)
+		// Initialize auth response channel for encrypt_after_auth mode
+		if cfg.EncryptAfterAuth && cfg.Key != "" {
+			t.authResponseChan = make(chan error, 1)
+		}
 		// Register server as a peer in the routing table so stats show the
 		// server route even when no other clients are present.
 		if t.routingTable != nil {
@@ -862,11 +866,6 @@ func (t *Tunnel) performClientAuthentication() error {
 		return fmt.Errorf("failed to encrypt auth packet: %v", err)
 	}
 	
-	// Create response channel if not already created
-	if t.authResponseChan == nil {
-		t.authResponseChan = make(chan error, 1)
-	}
-	
 	// Send authentication packet
 	if err := t.conn.WritePacket(encryptedAuth); err != nil {
 		return fmt.Errorf("failed to send auth packet: %v", err)
@@ -874,6 +873,10 @@ func (t *Tunnel) performClientAuthentication() error {
 	
 	// Wait for authentication response (with timeout)
 	// The response will be handled by netReader and sent to authResponseChan
+	if t.authResponseChan == nil {
+		return fmt.Errorf("auth response channel not initialized")
+	}
+	
 	select {
 	case err := <-t.authResponseChan:
 		if err != nil {
@@ -1473,13 +1476,17 @@ func (t *Tunnel) netReader() {
 					select {
 					case t.authResponseChan <- fmt.Errorf("authentication rejected: %s", responseData):
 					default:
+						log.Printf("⚠️  Failed to send auth error to channel (channel full or closed): %s", responseData)
 					}
 				} else {
 					select {
 					case t.authResponseChan <- nil:
 					default:
+						log.Printf("⚠️  Failed to send auth success to channel (channel full or closed)")
 					}
 				}
+			} else if t.config.EncryptAfterAuth {
+				log.Printf("⚠️  Received auth response but channel is nil - this shouldn't happen")
 			}
 		case PacketTypeKeepalive:
 			// Keepalive received, no action needed
