@@ -326,10 +326,10 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 		}
 		
 		if cfg.EncryptAfterAuth {
-			log.Println("✅ Authentication-only mode enabled (encrypt_after_auth=true)")
-			log.Println("   - Data packets will NOT be encrypted after authentication")
-			log.Println("   - Control packets will remain encrypted for security")
-			log.Println("   - Lower CPU overhead, faster data transmission")
+			log.Printf("✅ Authentication-only mode enabled (encrypt_after_auth=true)\n" +
+				"   - Data packets will NOT be encrypted after authentication\n" +
+				"   - Control packets will remain encrypted for security\n" +
+				"   - Lower CPU overhead, faster data transmission")
 		} else {
 			log.Println("Encryption enabled with AES-256-GCM")
 		}
