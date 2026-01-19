@@ -192,7 +192,10 @@ func TestDecodeLargeData(t *testing.T) {
 	}
 
 	// Simulate missing first shard only
-	// Note: The simple XOR-based FEC implementation can recover one missing data shard per parity shard available
+	// Note: This simple XOR-based FEC implementation has limited recovery capabilities.
+	// It creates parity shards that are XOR of all data shards, allowing recovery of
+	// only one missing data shard at a time (not one per parity shard).
+	// For production use with better recovery, consider proper Reed-Solomon encoding.
 	shardPresent := make([]bool, len(shards))
 	for i := range shardPresent {
 		shardPresent[i] = true

@@ -100,6 +100,7 @@ func (f *FEC) Decode(shards [][]byte, shardPresent []bool) ([]byte, error) {
 	// This handles the case where shards arrive out of order
 	var shardSize int
 	for i := 0; i < len(shards); i++ {
+		// Check both shardPresent and nil as a defensive measure for network data
 		if shardPresent[i] && shards[i] != nil && len(shards[i]) > 0 {
 			shardSize = len(shards[i])
 			break
