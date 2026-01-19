@@ -37,6 +37,8 @@ const (
 	PacketTypeConfigUpdate = 0x07 // Server pushes new config (e.g., rotated key)
 	PacketTypeP2PRequest   = 0x08 // Client requests P2P connection to another client
 	PacketTypeFECShard     = 0x09 // FEC encoded shard
+	PacketTypeAuth         = 0x0A // Authentication handshake packet
+	PacketTypeAuthResponse = 0x0B // Authentication response packet
 
 	// IPv4 constants
 	IPv4Version      = 4
@@ -103,6 +105,7 @@ type ClientConnection struct {
 	cipher       *crypto.Cipher
 	cipherGen    uint64
 	lastRecvTime time.Time // Last time we received a packet from this client
+	authenticated bool     // Whether this client has been authenticated (for encrypt_after_auth mode)
 	mu           sync.RWMutex
 }
 
@@ -207,6 +210,10 @@ type Tunnel struct {
 	fecRecvSessions  map[uint32]*fecRecvSession  // FEC receive sessions (session ID -> session)
 	fecRecvMux       sync.Mutex                  // Protects fecRecvSessions
 	fecCleanupTicker *time.Ticker                // Ticker for cleaning up stale FEC sessions
+
+	// Authentication state (for encrypt_after_auth mode)
+	authenticated bool        // Whether client is authenticated (client mode)
+	authMux       sync.Mutex  // Protects authenticated flag
 }
 
 // prependPacketType adds a leading packet type byte to the payload.
@@ -791,7 +798,98 @@ func (t *Tunnel) connectClient() error {
 
 	t.conn = conn
 	log.Printf("Connected to server: %s -> %s", conn.LocalAddr(), conn.RemoteAddr())
+	
+	// Perform authentication handshake if encrypt_after_auth mode is enabled
+	if t.config.EncryptAfterAuth && t.cipher != nil {
+		if err := t.performClientAuthentication(); err != nil {
+			conn.Close()
+			return fmt.Errorf("authentication failed: %v", err)
+		}
+		log.Printf("✅ Authentication successful - data packets will not be encrypted")
+	}
+	
 	return nil
+}
+
+// performClientAuthentication performs the authentication handshake with server
+func (t *Tunnel) performClientAuthentication() error {
+	// Create authentication packet with timestamp and tunnel IP
+	authData := fmt.Sprintf("%d|%s", time.Now().Unix(), t.myTunnelIP.String())
+	authPacket := make([]byte, len(authData)+1)
+	authPacket[0] = PacketTypeAuth
+	copy(authPacket[1:], []byte(authData))
+	
+	// Encrypt the authentication packet (always encrypted for security)
+	t.cipherMux.RLock()
+	cipher := t.cipher
+	t.cipherMux.RUnlock()
+	
+	if cipher == nil {
+		return fmt.Errorf("cipher not available for authentication")
+	}
+	
+	encryptedAuth, err := cipher.Encrypt(authPacket)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt auth packet: %v", err)
+	}
+	
+	// Send authentication packet
+	if err := t.conn.WritePacket(encryptedAuth); err != nil {
+		return fmt.Errorf("failed to send auth packet: %v", err)
+	}
+	
+	// Wait for authentication response (with timeout)
+	responseChan := make(chan error, 1)
+	go func() {
+		// Read response packet
+		packet, err := t.conn.ReadPacket()
+		if err != nil {
+			responseChan <- fmt.Errorf("failed to read auth response: %v", err)
+			return
+		}
+		
+		// Decrypt response
+		decrypted, err := cipher.Decrypt(packet)
+		if err != nil {
+			responseChan <- fmt.Errorf("failed to decrypt auth response: %v", err)
+			return
+		}
+		
+		if len(decrypted) < 1 {
+			responseChan <- fmt.Errorf("invalid auth response")
+			return
+		}
+		
+		// Check if it's an auth response
+		if decrypted[0] != PacketTypeAuthResponse {
+			responseChan <- fmt.Errorf("unexpected packet type: %d", decrypted[0])
+			return
+		}
+		
+		// Parse response status
+		responseData := string(decrypted[1:])
+		if responseData != "OK" {
+			responseChan <- fmt.Errorf("authentication rejected: %s", responseData)
+			return
+		}
+		
+		responseChan <- nil
+	}()
+	
+	// Wait for response with timeout
+	select {
+	case err := <-responseChan:
+		if err != nil {
+			return err
+		}
+		// Authentication successful
+		t.authMux.Lock()
+		t.authenticated = true
+		t.authMux.Unlock()
+		return nil
+	case <-time.After(5 * time.Second):
+		return fmt.Errorf("authentication timeout")
+	}
 }
 
 // reconnectToServer attempts to reconnect to the server with exponential backoff.
@@ -1256,8 +1354,19 @@ func (t *Tunnel) netReader() {
 				// Only returns error when stopCh is closed
 				return
 			}
+			
+			// Re-authenticate if in encrypt_after_auth mode
+			if t.config.EncryptAfterAuth && t.cipher != nil {
+				t.authMux.Lock()
+				t.authenticated = false
+				t.authMux.Unlock()
+				
+				if err := t.performClientAuthentication(); err != nil {
+					log.Printf("Re-authentication failed after reconnect: %v", err)
+					// Continue anyway, will retry on next reconnect
+				}
+			}
 
-			// Successfully reconnected, continue reading
 			log.Printf("Reconnection successful, resuming packet reception")
 
 			// Reset last receive time after reconnection
@@ -1632,7 +1741,7 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 				if reconstructedPacket != nil {
 					// Successfully reconstructed encrypted packet
 					// Now decrypt it
-					decryptedPacket, usedCipher, gen, err := t.decryptPacketForServer(reconstructedPacket)
+					decryptedPacket, usedCipher, gen, err := t.decryptPacketFromClient(client, reconstructedPacket)
 					if err != nil {
 						log.Printf("FEC reconstructed packet decryption error from %s: %v", client.conn.RemoteAddr(), err)
 						continue
@@ -1660,7 +1769,7 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 			var err error
 			var usedCipher *crypto.Cipher
 			var gen uint64
-			packet, usedCipher, gen, err = t.decryptPacketForServer(packet)
+			packet, usedCipher, gen, err = t.decryptPacketFromClient(client, packet)
 			if err != nil {
 				log.Printf("Client decryption error from %s (wrong key?): %v", client.conn.RemoteAddr(), err)
 				continue
@@ -1680,6 +1789,11 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 		payload := packet[1:]
 
 		switch packetType {
+		case PacketTypeAuth:
+			// Handle authentication request (only in encrypt_after_auth mode)
+			if t.config.EncryptAfterAuth {
+				t.handleClientAuthentication(client, payload)
+			}
 		case PacketTypeData:
 			if len(payload) < IPv4MinHeaderLen {
 				continue
@@ -2761,6 +2875,7 @@ func (t *Tunnel) shouldSkipOuterEncryption(data []byte) bool {
 }
 
 // encryptPacket encrypts a packet if cipher is available
+// In encrypt_after_auth mode, only encrypts if not authenticated or for control packets
 func (t *Tunnel) encryptPacket(data []byte) ([]byte, error) {
 	t.cipherMux.RLock()
 	c := t.cipher
@@ -2768,6 +2883,24 @@ func (t *Tunnel) encryptPacket(data []byte) ([]byte, error) {
 	if c == nil {
 		return data, nil
 	}
+	
+	// Check if we should skip encryption for authenticated data packets
+	if t.config.EncryptAfterAuth && len(data) > 0 {
+		packetType := data[0]
+		// Only skip encryption for data packets after authentication
+		if packetType == PacketTypeData {
+			t.authMux.Lock()
+			isAuthenticated := t.authenticated
+			t.authMux.Unlock()
+			
+			if isAuthenticated {
+				// Skip encryption for data packets in authenticated session
+				return data, nil
+			}
+		}
+		// Control packets (keepalive, peer info, etc.) are always encrypted
+	}
+	
 	if t.shouldSkipOuterEncryption(data) {
 		return data, nil
 	}
@@ -2782,6 +2915,22 @@ func (t *Tunnel) decryptWithFallback(data []byte) ([]byte, *crypto.Cipher, uint6
 	prevGen := t.prevCipherGen
 	exp := t.prevCipherExp
 	t.cipherMux.RUnlock()
+
+	// In encrypt_after_auth mode, check if this is an authenticated data packet
+	if t.config.EncryptAfterAuth && len(data) > 0 {
+		packetType := data[0]
+		if packetType == PacketTypeData {
+			t.authMux.Lock()
+			isAuthenticated := t.authenticated
+			t.authMux.Unlock()
+			
+			if isAuthenticated {
+				// Data packets in authenticated sessions are not encrypted
+				return data, nil, 0, nil
+			}
+		}
+		// Control packets are always encrypted, so proceed with decryption
+	}
 
 	var activeErr error
 	if active != nil {
@@ -2823,10 +2972,49 @@ func (t *Tunnel) decryptPacketForServer(data []byte) ([]byte, *crypto.Cipher, ui
 	return t.decryptWithFallback(data)
 }
 
+// decryptPacketFromClient decrypts a packet from a specific client, checking authentication status
+func (t *Tunnel) decryptPacketFromClient(client *ClientConnection, data []byte) ([]byte, *crypto.Cipher, uint64, error) {
+	// Check if this is an authenticated client in encrypt_after_auth mode
+	if t.config.EncryptAfterAuth && client != nil && len(data) > 0 {
+		packetType := data[0]
+		if packetType == PacketTypeData {
+			client.mu.RLock()
+			isAuthenticated := client.authenticated
+			client.mu.RUnlock()
+			
+			if isAuthenticated {
+				// Data packets from authenticated clients are not encrypted
+				return data, nil, 0, nil
+			}
+		}
+		// Control packets are always encrypted, so proceed with decryption
+	}
+	
+	return t.decryptWithFallback(data)
+}
+
 func (t *Tunnel) encryptForClient(client *ClientConnection, data []byte) ([]byte, error) {
 	if t.shouldSkipOuterEncryption(data) {
 		return data, nil
 	}
+	
+	// Check if we should skip encryption for authenticated data packets
+	if t.config.EncryptAfterAuth && client != nil && len(data) > 0 {
+		packetType := data[0]
+		// Only skip encryption for data packets after authentication
+		if packetType == PacketTypeData {
+			client.mu.RLock()
+			isAuthenticated := client.authenticated
+			client.mu.RUnlock()
+			
+			if isAuthenticated {
+				// Skip encryption for data packets from authenticated client
+				return data, nil
+			}
+		}
+		// Control packets are always encrypted
+	}
+	
 	if client != nil {
 		if c, _ := client.getCipher(); c != nil {
 			return c.Encrypt(data)
@@ -2945,6 +3133,80 @@ func (t *Tunnel) expirePrevCipher(prev *crypto.Cipher) {
 	case <-timer.C:
 		t.deactivatePrevCipher(prev, "grace period expired")
 	case <-t.stopCh:
+	}
+}
+
+// handleClientAuthentication handles authentication request from client (server mode)
+func (t *Tunnel) handleClientAuthentication(client *ClientConnection, payload []byte) {
+	// Parse authentication data
+	authData := string(payload)
+	parts := strings.Split(authData, "|")
+	if len(parts) != 2 {
+		log.Printf("Invalid authentication request from %s: malformed data", client.conn.RemoteAddr())
+		t.sendAuthResponse(client, "INVALID")
+		return
+	}
+	
+	// Validate timestamp (prevent replay attacks)
+	timestamp, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		log.Printf("Invalid authentication request from %s: bad timestamp", client.conn.RemoteAddr())
+		t.sendAuthResponse(client, "INVALID")
+		return
+	}
+	
+	// Check if timestamp is within acceptable window (5 minutes)
+	now := time.Now().Unix()
+	if now-timestamp > 300 || timestamp-now > 300 {
+		log.Printf("Authentication request from %s rejected: timestamp out of range", client.conn.RemoteAddr())
+		t.sendAuthResponse(client, "EXPIRED")
+		return
+	}
+	
+	// Extract tunnel IP
+	tunnelIP := net.ParseIP(parts[1])
+	if tunnelIP == nil {
+		log.Printf("Invalid authentication request from %s: bad IP", client.conn.RemoteAddr())
+		t.sendAuthResponse(client, "INVALID")
+		return
+	}
+	
+	// Mark client as authenticated
+	client.mu.Lock()
+	client.authenticated = true
+	client.mu.Unlock()
+	
+	log.Printf("✅ Client %s authenticated successfully (IP: %s) - data packets will not be encrypted", 
+		client.conn.RemoteAddr(), tunnelIP)
+	
+	// Send success response
+	t.sendAuthResponse(client, "OK")
+}
+
+// sendAuthResponse sends authentication response to client
+func (t *Tunnel) sendAuthResponse(client *ClientConnection, status string) {
+	responsePacket := make([]byte, len(status)+1)
+	responsePacket[0] = PacketTypeAuthResponse
+	copy(responsePacket[1:], []byte(status))
+	
+	// Always encrypt auth response for security
+	t.cipherMux.RLock()
+	cipher := t.cipher
+	t.cipherMux.RUnlock()
+	
+	if cipher == nil {
+		log.Printf("Cannot send auth response: no cipher available")
+		return
+	}
+	
+	encryptedResponse, err := cipher.Encrypt(responsePacket)
+	if err != nil {
+		log.Printf("Failed to encrypt auth response: %v", err)
+		return
+	}
+	
+	if err := client.conn.WritePacket(encryptedResponse); err != nil {
+		log.Printf("Failed to send auth response to %s: %v", client.conn.RemoteAddr(), err)
 	}
 }
 
