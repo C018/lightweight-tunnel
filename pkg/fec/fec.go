@@ -2,7 +2,6 @@ package fec
 
 import (
 	"errors"
-	"fmt"
 )
 
 // ErrIncomplete indicates that not enough shards are present yet to reconstruct the data
