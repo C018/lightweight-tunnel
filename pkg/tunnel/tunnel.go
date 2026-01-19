@@ -216,8 +216,9 @@ type Tunnel struct {
 	fecCleanupTicker *time.Ticker                // Ticker for cleaning up stale FEC sessions
 
 	// Authentication state (for encrypt_after_auth mode)
-	authenticated bool        // Whether client is authenticated (client mode)
-	authMux       sync.Mutex  // Protects authenticated flag
+	authenticated    bool              // Whether client is authenticated (client mode)
+	authMux          sync.Mutex        // Protects authenticated flag
+	authResponseChan chan error        // Channel for receiving auth response (client mode)
 }
 
 // prependPacketType adds a leading packet type byte to the payload.
@@ -413,6 +414,11 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 	if cfg.Mode == "client" {
 		t.sendQueue = make(chan []byte, cfg.SendQueueSize)
 		t.recvQueue = make(chan []byte, cfg.RecvQueueSize)
+		// Initialize auth response channel for encrypt_after_auth mode
+		// Only initialize if a key is provided, since authentication requires encryption
+		if cfg.EncryptAfterAuth && cfg.Key != "" {
+			t.authResponseChan = make(chan error, 1)
+		}
 		// Register server as a peer in the routing table so stats show the
 		// server route even when no other clients are present.
 		if t.routingTable != nil {
@@ -867,46 +873,13 @@ func (t *Tunnel) performClientAuthentication() error {
 	}
 	
 	// Wait for authentication response (with timeout)
-	responseChan := make(chan error, 1)
-	go func() {
-		// Read response packet
-		packet, err := t.conn.ReadPacket()
-		if err != nil {
-			responseChan <- fmt.Errorf("failed to read auth response: %v", err)
-			return
-		}
-		
-		// Decrypt response
-		decrypted, err := cipher.Decrypt(packet)
-		if err != nil {
-			responseChan <- fmt.Errorf("failed to decrypt auth response: %v", err)
-			return
-		}
-		
-		if len(decrypted) < 1 {
-			responseChan <- fmt.Errorf("invalid auth response")
-			return
-		}
-		
-		// Check if it's an auth response
-		if decrypted[0] != PacketTypeAuthResponse {
-			responseChan <- fmt.Errorf("unexpected packet type: %d", decrypted[0])
-			return
-		}
-		
-		// Parse response status
-		responseData := string(decrypted[1:])
-		if responseData != "OK" {
-			responseChan <- fmt.Errorf("authentication rejected: %s", responseData)
-			return
-		}
-		
-		responseChan <- nil
-	}()
+	// The response will be handled by netReader and sent to authResponseChan
+	if t.authResponseChan == nil {
+		return fmt.Errorf("auth response channel not initialized")
+	}
 	
-	// Wait for response with timeout
 	select {
-	case err := <-responseChan:
+	case err := <-t.authResponseChan:
 		if err != nil {
 			return err
 		}
@@ -1494,6 +1467,33 @@ func (t *Tunnel) netReader() {
 					return
 				default:
 					log.Printf("Receive queue full after timeout, dropping packet")
+				}
+			}
+		case PacketTypeAuthResponse:
+			// Handle authentication response (client mode)
+			// This should only be received in encrypt_after_auth mode
+			if !t.config.EncryptAfterAuth {
+				log.Printf("⚠️  Received unexpected auth response (encrypt_after_auth is disabled)")
+				break
+			}
+			
+			if t.authResponseChan == nil {
+				log.Printf("⚠️  Received auth response but channel is nil - this shouldn't happen")
+				break
+			}
+			
+			responseData := string(payload)
+			if responseData != "OK" {
+				select {
+				case t.authResponseChan <- fmt.Errorf("authentication rejected: %s", responseData):
+				default:
+					log.Printf("⚠️  Failed to send auth error to channel (channel full or closed): %s", responseData)
+				}
+			} else {
+				select {
+				case t.authResponseChan <- nil:
+				default:
+					log.Printf("⚠️  Failed to send auth success to channel (channel full or closed)")
 				}
 			}
 		case PacketTypeKeepalive:
@@ -3792,11 +3792,12 @@ func (t *Tunnel) sendPacketWithFEC(conn faketcp.ConnAdapter, packet []byte) erro
 // processFECShard handles a received FEC shard and attempts to reconstruct the original packet
 // Returns the reconstructed packet if complete, or nil if more shards are needed
 func (t *Tunnel) processFECShard(fecPacket []byte) ([]byte, error) {
-	if len(fecPacket) < 13 {
+	// FEC header: sessionID(4) + shardIndex(2) + totalShards(2) + originalSize(4) = 12 bytes minimum
+	if len(fecPacket) < 12 {
 		return nil, errors.New("FEC packet too short")
 	}
 	
-	// Parse FEC header
+	// Parse FEC header (PacketTypeFECShard already stripped by caller)
 	sessionID := uint32(fecPacket[0])<<24 | uint32(fecPacket[1])<<16 | uint32(fecPacket[2])<<8 | uint32(fecPacket[3])
 	shardIndex := int(fecPacket[4])<<8 | int(fecPacket[5])
 	totalShards := int(fecPacket[6])<<8 | int(fecPacket[7])
