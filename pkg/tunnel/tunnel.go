@@ -3916,6 +3916,18 @@ func (t *Tunnel) processFECShard(peerAddr string, fecPacket []byte) ([]byte, err
 		// Attempt to decode
 		decodedData, err := t.fec.Decode(session.shards, session.shardPresent)
 		if err != nil {
+			// Suppress logs for expected incomplete or unrecoverable FEC sessions during packet loss
+			if err == fec.ErrIncomplete {
+				return nil, nil // Need more shards, not an error
+			}
+			if err == fec.ErrUnrecoverable {
+				// We've received enough total shards but too many data shards are missing
+				// for the XOR algorithm to handle. Clean up and move on quietly.
+				t.fecRecvMux.Lock()
+				delete(t.fecRecvSessions, sessionKey)
+				t.fecRecvMux.Unlock()
+				return nil, nil 
+			}
 			return nil, fmt.Errorf("FEC decoding failed: %v", err)
 		}
 		

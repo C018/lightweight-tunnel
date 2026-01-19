@@ -2,7 +2,14 @@ package fec
 
 import (
 	"errors"
+	"fmt"
 )
+
+// ErrIncomplete indicates that not enough shards are present yet to reconstruct the data
+var ErrIncomplete = errors.New("not enough shards to reconstruct data")
+
+// ErrUnrecoverable indicates that too many shards have been lost to ever reconstruct the data
+var ErrUnrecoverable = errors.New("too many missing data shards for XOR FEC reconstruction")
 
 // FEC implements Forward Error Correction using Reed-Solomon codes
 type FEC struct {
@@ -93,7 +100,7 @@ func (f *FEC) Decode(shards [][]byte, shardPresent []bool) ([]byte, error) {
 	}
 
 	if presentCount < f.dataShards {
-		return nil, errors.New("not enough shards to reconstruct data")
+		return nil, ErrIncomplete
 	}
 
 	// Determine shard size from any available shard
@@ -131,6 +138,8 @@ func (f *FEC) Decode(shards [][]byte, shardPresent []bool) ([]byte, error) {
 		}
 
 		if parityIdx == -1 {
+			// This should theoretically not happen if presentCount >= dataShards 
+			// and missingDataCount == 1, because that means at least one parity shard must be present.
 			return nil, errors.New("missing data shard and no parity shards available")
 		}
 
@@ -153,7 +162,13 @@ func (f *FEC) Decode(shards [][]byte, shardPresent []bool) ([]byte, error) {
 		// With simple XOR parity, we cannot recover more than one missing data shard.
 		// Even if presentCount >= dataShards (meaning we have multiple parity shards),
 		// they are identical in this implementation and don't provide extra information.
-		return nil, errors.New("too many missing data shards for XOR FEC reconstruction")
+		
+		// If we've received all possible shards and still can't recover, it's unrecoverable
+		if presentCount == f.dataShards+f.parityShards {
+			return nil, ErrUnrecoverable
+		}
+		// Otherwise, we might still receive a missing data shard
+		return nil, ErrIncomplete
 	}
 
 	// Reconstruct original data
