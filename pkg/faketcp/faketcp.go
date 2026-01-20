@@ -571,7 +571,8 @@ func (c *Conn) ReadPacket() ([]byte, error) {
 	}
 
 	// Connected socket - read directly (blocking); checks close on error
-	// c.udpConn.SetReadDeadline(time.Now().Add(ReadTimeoutDuration))
+	// SetReadDeadline REMOVED from hot path to eliminate system call overhead.
+	// Rely on Close() to unblockRead.
 
 	bufPtr := readBufPool.Get().([]byte)
 	defer readBufPool.Put(bufPtr)
@@ -579,7 +580,11 @@ func (c *Conn) ReadPacket() ([]byte, error) {
 
 	n, err := c.udpConn.Read(buf)
 	if err != nil {
-		// Check if it's a timeout - return a specific error to allow caller to retry
+		// Check if it's a closed error
+		if opErr, ok := err.(*net.OpError); ok && !opErr.Temporary() {
+			return nil, fmt.Errorf("connection closed")
+		}
+		// Check if it's a timeout
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 			return nil, netErr
 		}
@@ -605,12 +610,12 @@ func (c *Conn) ReadPacket() ([]byte, error) {
 
 	payloadLen := n - headerLen
 
-	c.mu.Lock()
-	// Update our ack number based on received sequence
-	c.ackNum = tcpHeader.SeqNum + uint32(payloadLen)
-	c.mu.Unlock()
+	// Atomic update of ackNum to avoid locking the Mutex in the hot read path
+	newAck := tcpHeader.SeqNum + uint32(payloadLen)
+	atomic.StoreUint32(&c.ackNum, newAck)
 
 	// Return payload (skip TCP header)
+	// We still allocate here for the upper layer, but syscall bottleneck and lock contention are gone
 	payload := make([]byte, payloadLen)
 	copy(payload, buf[headerLen:n])
 
@@ -632,11 +637,15 @@ func (c *Conn) buildTCPHeader(dataLen int) *TCPHeader {
 	// Options are intentionally omitted for minimal overhead and lower latency.
 	// This keeps packets small for disguise/performance at the cost of skipping
 	// features like MSS/window scaling negotiation.
+
+	// Use atomic load for AckNum since it's updated by the reader goroutine without lock
+	ack := atomic.LoadUint32(&c.ackNum)
+
 	return &TCPHeader{
 		SrcPort:    c.srcPort,
 		DstPort:    c.dstPort,
 		SeqNum:     c.seqNum,
-		AckNum:     c.ackNum,
+		AckNum:     ack,
 		DataOffset: 5, // will be adjusted in serialize
 		Flags:      PSH | ACK,
 		Window:     65535,
