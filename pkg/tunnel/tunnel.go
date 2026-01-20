@@ -854,6 +854,13 @@ func (t *Tunnel) configureTUN() error {
 		return fmt.Errorf("failed to set MTU: %v, output: %s", err, output)
 	}
 
+	// Best-effort: disable GRO/GSO/TSO offloads to prevent oversized packets
+	if output, err := exec.Command("ethtool", "-K", t.tunName, "gro", "off", "gso", "off", "tso", "off").CombinedOutput(); err != nil {
+		log.Printf("⚠️  Failed to disable offloads on %s: %v (output: %s)", t.tunName, err, strings.TrimSpace(string(output)))
+	} else {
+		log.Printf("Disabled offloads on %s (gro/gso/tso off)", t.tunName)
+	}
+
 	log.Printf("Configured %s with IP %s/%s, MTU %d", t.tunName, ip, netmask, t.config.MTU)
 	return nil
 }
@@ -1183,6 +1190,12 @@ func (t *Tunnel) tunReader() {
 				continue
 			}
 
+			if n > t.config.MTU {
+				log.Printf("⚠️  Dropping oversized TUN packet: %d > MTU %d", n, t.config.MTU)
+				t.releasePacketBuffer(buf)
+				continue
+			}
+
 			packet := readBuf[:n]
 
 			// Use intelligent routing if P2P is enabled
@@ -1241,6 +1254,12 @@ func (t *Tunnel) tunReaderServer() {
 		}
 
 		if n < IPv4MinHeaderLen {
+			t.releasePacketBuffer(buf)
+			continue
+		}
+
+		if n > t.config.MTU {
+			log.Printf("⚠️  Dropping oversized TUN packet: %d > MTU %d", n, t.config.MTU)
 			t.releasePacketBuffer(buf)
 			continue
 		}
