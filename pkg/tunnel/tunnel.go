@@ -437,6 +437,14 @@ func (t *Tunnel) handleRecoveredBatch(peerAddr string, sessionID uint32, packets
 		}
 		t.fecReorderBufs[peerAddr] = buf
 	}
+	if sessionID < buf.next {
+		// Late batch; deliver immediately to avoid loss
+		t.fecReorderMux.Unlock()
+		for _, pkt := range packets {
+			deliver(pkt)
+		}
+		return
+	}
 
 	buf.pending[sessionID] = packets
 	buf.lastUpdate = time.Now()
