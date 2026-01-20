@@ -2,6 +2,8 @@ package fec
 
 import (
 	"errors"
+
+	"github.com/klauspost/reedsolomon"
 )
 
 // ErrIncomplete indicates that not enough shards are present yet to reconstruct the data
@@ -15,6 +17,7 @@ type FEC struct {
 	dataShards   int
 	parityShards int
 	shardSize    int
+	encoder      reedsolomon.Encoder
 }
 
 // NewFEC creates a new FEC encoder/decoder
@@ -28,10 +31,16 @@ func NewFEC(dataShards, parityShards, shardSize int) (*FEC, error) {
 		return nil, errors.New("shardSize must be positive")
 	}
 
+	enc, err := reedsolomon.New(dataShards, parityShards)
+	if err != nil {
+		return nil, err
+	}
+
 	return &FEC{
 		dataShards:   dataShards,
 		parityShards: parityShards,
 		shardSize:    shardSize,
+		encoder:      enc,
 	}, nil
 }
 
@@ -65,17 +74,13 @@ func (f *FEC) Encode(data []byte) ([][]byte, error) {
 		}
 	}
 
-	// Create parity shards using XOR-based simple FEC
-	// For production use, consider using a proper Reed-Solomon library
+	// Create parity shards using Reed-Solomon
 	for i := 0; i < f.parityShards; i++ {
 		shards[f.dataShards+i] = make([]byte, shardSize)
-		for j := 0; j < shardSize; j++ {
-			var val byte
-			for k := 0; k < f.dataShards; k++ {
-				val ^= shards[k][j]
-			}
-			shards[f.dataShards+i][j] = val
-		}
+	}
+
+	if err := f.encoder.Encode(shards); err != nil {
+		return nil, err
 	}
 
 	return shards, nil
@@ -102,7 +107,7 @@ func (f *FEC) Decode(shards [][]byte, shardPresent []bool) ([]byte, error) {
 		return nil, ErrIncomplete
 	}
 
-	// Determine shard size from any available shard
+	// Determine shard size from any available shard and validate consistency
 	var shardSize int
 	for i := 0; i < len(shards); i++ {
 		if shardPresent[i] && shards[i] != nil && len(shards[i]) > 0 {
@@ -113,60 +118,23 @@ func (f *FEC) Decode(shards [][]byte, shardPresent []bool) ([]byte, error) {
 	if shardSize == 0 {
 		return nil, errors.New("no valid shards found to determine shard size")
 	}
-
-	// Count missing data shards
-	missingDataIdx := -1
-	missingDataCount := 0
-	for i := 0; i < f.dataShards; i++ {
-		if !shardPresent[i] {
-			missingDataCount++
-			missingDataIdx = i
+	for i := 0; i < len(shards); i++ {
+		if shardPresent[i] && shards[i] != nil && len(shards[i]) != shardSize {
+			return nil, errors.New("inconsistent shard size")
 		}
 	}
 
-	// Simple XOR-based reconstruction
-	// XOR FEC can only recover ONE missing data shard using ONE parity shard
-	if missingDataCount == 1 {
-		// Find any available parity shard
-		parityIdx := -1
-		for i := 0; i < f.parityShards; i++ {
-			if shardPresent[f.dataShards+i] {
-				parityIdx = f.dataShards + i
-				break
-			}
+	// Mark missing shards as nil for reconstruction
+	for i := 0; i < len(shards); i++ {
+		if !shardPresent[i] {
+			shards[i] = nil
 		}
+	}
 
-		if parityIdx == -1 {
-			// This should theoretically not happen if presentCount >= dataShards 
-			// and missingDataCount == 1, because that means at least one parity shard must be present.
-			return nil, errors.New("missing data shard and no parity shards available")
-		}
-
-		// Reconstruct the single missing data shard using the parity shard
-		shards[missingDataIdx] = make([]byte, shardSize)
-		for j := 0; j < shardSize; j++ {
-			var val byte
-			// XOR all other (present) data shards
-			for k := 0; k < f.dataShards; k++ {
-				if k != missingDataIdx {
-					val ^= shards[k][j]
-				}
-			}
-			// XOR with the available parity shard
-			val ^= shards[parityIdx][j]
-			shards[missingDataIdx][j] = val
-		}
-		shardPresent[missingDataIdx] = true
-	} else if missingDataCount > 1 {
-		// With simple XOR parity, we cannot recover more than one missing data shard.
-		// Even if presentCount >= dataShards (meaning we have multiple parity shards),
-		// they are identical in this implementation and don't provide extra information.
-		
-		// If we've received all possible shards and still can't recover, it's unrecoverable
+	if err := f.encoder.Reconstruct(shards); err != nil {
 		if presentCount == f.dataShards+f.parityShards {
 			return nil, ErrUnrecoverable
 		}
-		// Otherwise, we might still receive a missing data shard
 		return nil, ErrIncomplete
 	}
 
@@ -192,4 +160,24 @@ func (f *FEC) ParityShards() int {
 // TotalShards returns the total number of shards
 func (f *FEC) TotalShards() int {
 	return f.dataShards + f.parityShards
+}
+
+// EncodeShards encodes data+parity shards using Reed-Solomon.
+// shards length must be dataShards+parityShards and each shard must be the same size.
+func EncodeShards(shards [][]byte, dataShards, parityShards int) error {
+	enc, err := reedsolomon.New(dataShards, parityShards)
+	if err != nil {
+		return err
+	}
+	return enc.Encode(shards)
+}
+
+// ReconstructShards reconstructs missing shards in-place.
+// Missing shards should be nil.
+func ReconstructShards(shards [][]byte, dataShards, parityShards int) error {
+	enc, err := reedsolomon.New(dataShards, parityShards)
+	if err != nil {
+		return err
+	}
+	return enc.Reconstruct(shards)
 }

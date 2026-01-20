@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -1486,31 +1487,27 @@ func (t *Tunnel) netReader() {
 		// FEC shards are NOT encrypted themselves - they contain pieces of encrypted data
 		if len(packet) > 0 && packet[0] == PacketTypeFECShard {
 			if t.fecEnabled {
-				reconstructedPacket, err := t.processFECShard(t.config.RemoteAddr, packet[1:])
+				reconstructedPackets, err := t.processFECShard(t.config.RemoteAddr, packet[1:])
 				if err != nil {
 					log.Printf("FEC shard processing error: %v", err)
 					continue
 				}
-				
-				if reconstructedPacket != nil {
-					// Successfully reconstructed encrypted packet
-					// Now decrypt it
+
+				for _, reconstructedPacket := range reconstructedPackets {
 					decryptedPacket, err := t.decryptPacket(reconstructedPacket)
 					if err != nil {
 						log.Printf("FEC reconstructed packet decryption error: %v", err)
 						continue
 					}
-					
+
 					if len(decryptedPacket) < 1 {
 						continue
 					}
-					
-					// Process the decrypted packet
+
 					packetType := decryptedPacket[0]
 					payload := decryptedPacket[1:]
-					
+
 					if packetType == PacketTypeData {
-						// Queue for TUN device
 						if !enqueueWithTimeout(t.recvQueue, payload, t.stopCh) {
 							select {
 							case <-t.stopCh:
@@ -1521,7 +1518,6 @@ func (t *Tunnel) netReader() {
 						}
 					}
 				}
-				// If reconstructedPacket is nil, we need more shards
 			}
 			continue
 		}
@@ -1642,85 +1638,154 @@ func (t *Tunnel) netReader() {
 func (t *Tunnel) netWriter() {
 	defer t.wg.Done()
 
+	if !t.fecEnabled {
+		for {
+			select {
+			case <-t.stopCh:
+				return
+			case packet := <-t.sendQueue:
+				func() {
+					defer t.releasePacketBuffer(packet)
+
+					fullPacket, _ := prependPacketType(packet, PacketTypeData)
+
+					// Encrypt if cipher is available
+					encryptedPacket, err := t.encryptPacket(fullPacket)
+					if err != nil {
+						log.Printf("Encryption error: %v", err)
+						return
+					}
+
+					// Ensure we have a live connection before writing
+					if t.conn == nil {
+						if err := t.reconnectToServer(); err != nil {
+							return
+						}
+					}
+
+					sendErr := t.conn.WritePacket(encryptedPacket)
+					if sendErr != nil {
+						select {
+						case <-t.stopCh:
+							return
+						default:
+							log.Printf("Network write error: %v, attempting reconnection...", sendErr)
+						}
+
+						t.connMux.Lock()
+						if t.conn != nil {
+							_ = t.conn.Close()
+							t.conn = nil
+						}
+						t.connMux.Unlock()
+
+						if err := t.reconnectToServer(); err != nil {
+							return
+						}
+
+						log.Printf("Reconnection successful, retrying packet send")
+						t.reannounceP2PInfoAfterReconnect()
+
+						if t.conn != nil {
+							retryErr := t.conn.WritePacket(encryptedPacket)
+							if retryErr != nil {
+								log.Printf("Network write retry failed: %v, packet will be lost", retryErr)
+							}
+						}
+					}
+				}()
+			}
+		}
+	}
+
+	// FEC enabled: batch packets within a short window for cross-packet recovery
+	const fecBatchTimeout = 10 * time.Millisecond
+	dataShards := t.config.FECDataShards
+	batch := make([][]byte, 0, dataShards)
+	flushTimer := time.NewTimer(fecBatchTimeout)
+	if !flushTimer.Stop() {
+		select {
+		case <-flushTimer.C:
+		default:
+		}
+	}
+
+	resetTimer := func() {
+		if !flushTimer.Stop() {
+			select {
+			case <-flushTimer.C:
+			default:
+			}
+		}
+		flushTimer.Reset(fecBatchTimeout)
+	}
+
+	flushBatch := func(parityShards int) {
+		if len(batch) == 0 {
+			return
+		}
+		defer func() {
+			for _, pkt := range batch {
+				t.releasePacketBuffer(pkt)
+			}
+			batch = batch[:0]
+		}()
+
+		// Ensure connection
+		if t.conn == nil {
+			if err := t.reconnectToServer(); err != nil {
+				return
+			}
+		}
+
+		sendErr := t.sendBatchWithFEC(t.conn, batch, parityShards, t.encryptPacket)
+		if sendErr != nil {
+			select {
+			case <-t.stopCh:
+				return
+			default:
+				log.Printf("Network write error: %v, attempting reconnection...", sendErr)
+			}
+
+			t.connMux.Lock()
+			if t.conn != nil {
+				_ = t.conn.Close()
+				t.conn = nil
+			}
+			t.connMux.Unlock()
+
+			if err := t.reconnectToServer(); err != nil {
+				return
+			}
+			log.Printf("Reconnection successful, retrying batch send")
+			t.reannounceP2PInfoAfterReconnect()
+
+			if t.conn != nil {
+				retryErr := t.sendBatchWithFEC(t.conn, batch, parityShards, t.encryptPacket)
+				if retryErr != nil {
+					log.Printf("Network write retry failed: %v, batch will be lost", retryErr)
+				}
+			}
+		}
+	}
+
 	for {
 		select {
 		case <-t.stopCh:
+			flushBatch(1)
 			return
 		case packet := <-t.sendQueue:
-			func() {
-				defer t.releasePacketBuffer(packet)
-
-				fullPacket, _ := prependPacketType(packet, PacketTypeData)
-
-				// Encrypt if cipher is available
-				encryptedPacket, err := t.encryptPacket(fullPacket)
-				if err != nil {
-					log.Printf("Encryption error: %v", err)
-					return
-				}
-
-				// Ensure we have a live connection before writing
-				if t.conn == nil {
-					if err := t.reconnectToServer(); err != nil {
-						// Only returns error when stopCh is closed
-						return
-					}
-				}
-
-				// Send with FEC if enabled
-				var sendErr error
-				if t.fecEnabled {
-					sendErr = t.sendPacketWithFEC(t.conn, encryptedPacket)
-				} else {
-					sendErr = t.conn.WritePacket(encryptedPacket)
-				}
-
-				if sendErr != nil {
-					select {
-					case <-t.stopCh:
-						// Tunnel is stopping, no need to log
-						return
-					default:
-						log.Printf("Network write error: %v, attempting reconnection...", sendErr)
-					}
-
-					// Close and clear connection then try to reconnect
-					t.connMux.Lock()
-					if t.conn != nil {
-						_ = t.conn.Close()
-						t.conn = nil
-					}
-					t.connMux.Unlock()
-
-					// Keep trying to reconnect - only exits if tunnel is stopping
-					if err := t.reconnectToServer(); err != nil {
-						// Only returns error when stopCh is closed
-						return
-					}
-
-					// Try writing once more after reconnect
-					log.Printf("Reconnection successful, retrying packet send")
-
-					// Re-announce P2P info after reconnection to re-establish P2P connections
-					t.reannounceP2PInfoAfterReconnect()
-
-					if t.conn != nil {
-						var retryErr error
-						if t.fecEnabled {
-							retryErr = t.sendPacketWithFEC(t.conn, encryptedPacket)
-						} else {
-							retryErr = t.conn.WritePacket(encryptedPacket)
-						}
-						if retryErr != nil {
-							log.Printf("Network write retry failed: %v, packet will be lost", retryErr)
-							// Don't return - continue processing queue
-							// Accept packet loss to maintain tunnel connectivity for subsequent packets.
-							// This is better than exiting the goroutine, which would prevent any future
-							// packets from being sent even after the connection is restored.
-						}
-					}
-				}
-			}()
+			batch = append(batch, packet)
+			if len(batch) == 1 {
+				resetTimer()
+			}
+			if len(batch) >= dataShards {
+				flushBatch(t.config.FECParityShards)
+			}
+		case <-flushTimer.C:
+			if len(batch) > 0 {
+				flushBatch(1)
+			}
 		}
 	}
 }
@@ -1852,38 +1917,28 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 		// FEC shards are NOT encrypted themselves - they contain pieces of encrypted data
 		if len(packet) > 0 && packet[0] == PacketTypeFECShard {
 			if t.fecEnabled {
-				reconstructedPacket, err := t.processFECShard(client.conn.RemoteAddr().String(), packet[1:])
+				reconstructedPackets, err := t.processFECShard(client.conn.RemoteAddr().String(), packet[1:])
 				if err != nil {
 					log.Printf("FEC shard processing error from client %s: %v", client.conn.RemoteAddr(), err)
 					continue
 				}
-				
-				if reconstructedPacket != nil {
-					// Successfully reconstructed encrypted packet
-					// Now decrypt it
+
+				for _, reconstructedPacket := range reconstructedPackets {
 					decryptedPacket, usedCipher, gen, err := t.decryptPacketFromClient(client, reconstructedPacket)
 					if err != nil {
 						log.Printf("FEC reconstructed packet decryption error from %s: %v", client.conn.RemoteAddr(), err)
 						continue
 					}
-					
 					if usedCipher != nil {
 						client.setCipherWithGen(usedCipher, gen)
 					}
-					
-					if len(decryptedPacket) < 1 {
-						continue
+					if !t.handleClientPacket(client, decryptedPacket) {
+						return
 					}
-					
-					// Process the decrypted packet - use the packet variable for the rest of the code
-					packet = decryptedPacket
-				} else {
-					// Need more shards
-					continue
 				}
-			} else {
 				continue
 			}
+			continue
 		} else {
 			// Decrypt if cipher is available (supports previous key during grace)
 			var err error
@@ -1900,48 +1955,91 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 			}
 		}
 
-		if len(packet) < 1 {
-			continue
+		if !t.handleClientPacket(client, packet) {
+			return
+		}
+	}
+}
+
+// handleClientPacket processes a decrypted packet from a client connection.
+// Returns false when the caller should terminate the loop.
+func (t *Tunnel) handleClientPacket(client *ClientConnection, packet []byte) bool {
+	if len(packet) < 1 {
+		return true
+	}
+
+	packetType := packet[0]
+	payload := packet[1:]
+
+	switch packetType {
+	case PacketTypeAuth:
+		if t.config.EncryptAfterAuth {
+			t.handleClientAuthentication(client, payload)
+		}
+	case PacketTypeData:
+		if len(payload) < IPv4MinHeaderLen {
+			return true
 		}
 
-		// Check packet type
-		packetType := packet[0]
-		payload := packet[1:]
+		if payload[0]>>4 == IPv4Version { // IPv4
+			srcIP := net.IP(payload[IPv4SrcIPOffset : IPv4SrcIPOffset+4])
 
-		switch packetType {
-		case PacketTypeAuth:
-			// Handle authentication request (only in encrypt_after_auth mode)
-			if t.config.EncryptAfterAuth {
-				t.handleClientAuthentication(client, payload)
-			}
-		case PacketTypeData:
-			if len(payload) < IPv4MinHeaderLen {
-				continue
+			if client.clientIP == nil {
+				t.addClient(client, srcIP)
+			} else if !client.clientIP.Equal(srcIP) {
+				log.Printf("WARNING: Client %s trying to send packet with different source IP %s (registered as %s). Dropping packet.",
+					client.conn.RemoteAddr(), srcIP, client.clientIP)
+				return true
 			}
 
-			// Extract source IP from the packet to register client
-			if payload[0]>>4 == IPv4Version { // IPv4
-				srcIP := net.IP(payload[IPv4SrcIPOffset : IPv4SrcIPOffset+4])
+			dstIP := net.IP(payload[IPv4DstIPOffset : IPv4DstIPOffset+4])
 
-				// Register client IP if not yet registered
-				if client.clientIP == nil {
-					// First packet from this client, register its IP
-					t.addClient(client, srcIP)
-				} else if !client.clientIP.Equal(srcIP) {
-					// Client is trying to send packets with a different source IP
-					// This is a potential DoS/hijacking attempt
-					log.Printf("WARNING: Client %s trying to send packet with different source IP %s (registered as %s). Dropping packet.",
-						client.conn.RemoteAddr(), srcIP, client.clientIP)
-					continue
+			if t.config.ClientIsolation {
+				if _, err := t.tunFile.Write(payload); err != nil {
+					select {
+					case <-t.stopCh:
+						// Tunnel is stopping, no need to log
+					default:
+						log.Printf("TUN write error: %v", err)
+					}
+					return false
 				}
+			} else {
+				targetClient := t.getClientByIP(dstIP)
+				if targetClient != nil && targetClient != client {
+					forwardBuf := t.getPacketBuffer()
+					forwardPacket := forwardBuf[:len(payload)]
+					copy(forwardPacket, payload)
 
-				// Route packet based on destination
-				dstIP := net.IP(payload[IPv4DstIPOffset : IPv4DstIPOffset+4])
-
-				// Check if destination is another client
-				if t.config.ClientIsolation {
-					// In isolation mode, only send to TUN device (server)
-					// Clients cannot communicate with each other
+					queued := false
+					select {
+					case targetClient.sendQueue <- forwardPacket:
+						queued = true
+					case <-t.stopCh:
+						t.releasePacketBuffer(forwardBuf)
+						return false
+					case <-client.stopCh:
+						t.releasePacketBuffer(forwardBuf)
+						return false
+					case <-time.After(QueueSendTimeout):
+						select {
+						case targetClient.sendQueue <- forwardPacket:
+							queued = true
+						case <-t.stopCh:
+							t.releasePacketBuffer(forwardBuf)
+							return false
+						case <-client.stopCh:
+							t.releasePacketBuffer(forwardBuf)
+							return false
+						default:
+							log.Printf("⚠️  Target client send queue full for %s after timeout, dropping packet", dstIP)
+							t.releasePacketBuffer(forwardBuf)
+						}
+					}
+					if !queued {
+						t.releasePacketBuffer(forwardBuf)
+					}
+				} else {
 					if _, err := t.tunFile.Write(payload); err != nil {
 						select {
 						case <-t.stopCh:
@@ -1949,151 +2047,155 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 						default:
 							log.Printf("TUN write error: %v", err)
 						}
-						return
-					}
-				} else {
-					// Check if packet is for another client
-					targetClient := t.getClientByIP(dstIP)
-					if targetClient != nil && targetClient != client {
-						// Forward to target client (server relay mode)
-						// This is expected when P2P is not yet established or when P2P fails
-						// 
-						// IMPORTANT: payload comes from aead.Open which allocates a new slice
-						// We need to copy it into a pooled buffer so it can be properly recycled
-						forwardBuf := t.getPacketBuffer()
-						forwardPacket := forwardBuf[:len(payload)]
-						copy(forwardPacket, payload)
-						
-						queued := false
-						select {
-						case targetClient.sendQueue <- forwardPacket:
-							queued = true
-						case <-t.stopCh:
-							t.releasePacketBuffer(forwardBuf)
-							return
-						case <-client.stopCh:
-							t.releasePacketBuffer(forwardBuf)
-							return
-						case <-time.After(QueueSendTimeout):
-							// Wait for queue space
-							select {
-							case targetClient.sendQueue <- forwardPacket:
-								queued = true
-							case <-t.stopCh:
-								t.releasePacketBuffer(forwardBuf)
-								return
-							case <-client.stopCh:
-								t.releasePacketBuffer(forwardBuf)
-								return
-							default:
-								log.Printf("⚠️  Target client send queue full for %s after timeout, dropping packet", dstIP)
-								t.releasePacketBuffer(forwardBuf)
-							}
-						}
-						// Only release if not queued (clientNetWriter will release if queued)
-						if !queued {
-							t.releasePacketBuffer(forwardBuf)
-						}
-					} else {
-						// Send to TUN device (for server or unknown destination)
-						if _, err := t.tunFile.Write(payload); err != nil {
-							select {
-							case <-t.stopCh:
-								// Tunnel is stopping, no need to log
-							default:
-								log.Printf("TUN write error: %v", err)
-							}
-							return
-						}
+						return false
 					}
 				}
-			}
-		case PacketTypeKeepalive:
-			// Keepalive received, no action needed
-		case PacketTypePeerInfo:
-			// Handle peer info from client (server mode) - store but don't broadcast
-			if t.config.P2PEnabled {
-				peerInfoStr := string(payload)
-				log.Printf("Received and stored peer info from client: %s", peerInfoStr)
-
-				// Parse peer info to get tunnel IP
-				parts := strings.Split(peerInfoStr, "|")
-				if len(parts) >= 3 {
-					tunnelIP := net.ParseIP(parts[0])
-					if tunnelIP != nil {
-						// Register client if not yet registered
-						if client.clientIP == nil {
-							t.addClient(client, tunnelIP)
-						}
-
-						// Store peer info for on-demand P2P connection establishment
-						// No automatic broadcast - connections established only when needed
-						client.mu.Lock()
-						client.lastPeerInfo = peerInfoStr
-						client.mu.Unlock()
-						log.Printf("Stored peer info for %s, ready for on-demand P2P", tunnelIP)
-					}
-				}
-			}
-		case PacketTypeP2PRequest:
-			// Handle P2P connection request from client (server mode)
-			t.handleP2PRequest(client, payload)
-		case PacketTypeRouteInfo:
-			// Register routes advertised by client and respond with server routes
-			routes := parseRouteList(string(payload))
-			if len(routes) > 0 {
-				t.registerClientRoutes(client, routes)
-				go t.sendRoutesToClient(client)
 			}
 		}
+	case PacketTypeKeepalive:
+		// Keepalive received, no action needed
+	case PacketTypePeerInfo:
+		if t.config.P2PEnabled {
+			peerInfoStr := string(payload)
+			log.Printf("Received and stored peer info from client: %s", peerInfoStr)
+
+			parts := strings.Split(peerInfoStr, "|")
+			if len(parts) >= 3 {
+				tunnelIP := net.ParseIP(parts[0])
+				if tunnelIP != nil {
+					if client.clientIP == nil {
+						t.addClient(client, tunnelIP)
+					}
+
+					client.mu.Lock()
+					client.lastPeerInfo = peerInfoStr
+					client.mu.Unlock()
+					log.Printf("Stored peer info for %s, ready for on-demand P2P", tunnelIP)
+				}
+			}
+		}
+	case PacketTypeP2PRequest:
+		t.handleP2PRequest(client, payload)
+	case PacketTypeRouteInfo:
+		routes := parseRouteList(string(payload))
+		if len(routes) > 0 {
+			t.registerClientRoutes(client, routes)
+			go t.sendRoutesToClient(client)
+		}
 	}
+
+	return true
 }
 
 // clientNetWriter writes packets from client send queue to network
 func (t *Tunnel) clientNetWriter(client *ClientConnection) {
 	defer client.wg.Done()
 
+	if !t.fecEnabled {
+		for {
+			select {
+			case <-t.stopCh:
+				return
+			case <-client.stopCh:
+				return
+			case packet := <-client.sendQueue:
+				func() {
+					defer t.releasePacketBuffer(packet)
+
+					fullPacket, _ := prependPacketType(packet, PacketTypeData)
+
+					encryptedPacket, err := t.encryptForClient(client, fullPacket)
+					if err != nil {
+						log.Printf("Client encryption error: %v", err)
+						return
+					}
+
+					sendErr := client.conn.WritePacket(encryptedPacket)
+					if sendErr != nil {
+						select {
+						case <-t.stopCh:
+						case <-client.stopCh:
+						default:
+							log.Printf("Client network write error to %s: %v", client.conn.RemoteAddr(), sendErr)
+						}
+						client.stopOnce.Do(func() {
+							close(client.stopCh)
+						})
+					}
+				}()
+			}
+		}
+	}
+
+	// FEC enabled: batch packets within a short window for cross-packet recovery
+	const fecBatchTimeout = 10 * time.Millisecond
+	dataShards := t.config.FECDataShards
+	batch := make([][]byte, 0, dataShards)
+	flushTimer := time.NewTimer(fecBatchTimeout)
+	if !flushTimer.Stop() {
+		select {
+		case <-flushTimer.C:
+		default:
+		}
+	}
+
+	resetTimer := func() {
+		if !flushTimer.Stop() {
+			select {
+			case <-flushTimer.C:
+			default:
+			}
+		}
+		flushTimer.Reset(fecBatchTimeout)
+	}
+
+	flushBatch := func(parityShards int) {
+		if len(batch) == 0 {
+			return
+		}
+		defer func() {
+			for _, pkt := range batch {
+				t.releasePacketBuffer(pkt)
+			}
+			batch = batch[:0]
+		}()
+
+		sendErr := t.sendBatchWithFEC(client.conn, batch, parityShards, func(p []byte) ([]byte, error) {
+			return t.encryptForClient(client, p)
+		})
+		if sendErr != nil {
+			select {
+			case <-t.stopCh:
+			case <-client.stopCh:
+			default:
+				log.Printf("Client network write error to %s: %v", client.conn.RemoteAddr(), sendErr)
+			}
+			client.stopOnce.Do(func() {
+				close(client.stopCh)
+			})
+		}
+	}
+
 	for {
 		select {
 		case <-t.stopCh:
+			flushBatch(1)
 			return
 		case <-client.stopCh:
+			flushBatch(1)
 			return
 		case packet := <-client.sendQueue:
-			func() {
-				defer t.releasePacketBuffer(packet)
-
-				fullPacket, _ := prependPacketType(packet, PacketTypeData)
-
-				// Encrypt if cipher is available
-				encryptedPacket, err := t.encryptForClient(client, fullPacket)
-				if err != nil {
-					log.Printf("Client encryption error: %v", err)
-					return
-				}
-
-				// Send with FEC if enabled
-				var sendErr error
-				if t.fecEnabled {
-					sendErr = t.sendPacketWithFEC(client.conn, encryptedPacket)
-				} else {
-					sendErr = client.conn.WritePacket(encryptedPacket)
-				}
-
-				if sendErr != nil {
-					select {
-					case <-t.stopCh:
-						// Tunnel is stopping, no need to log
-					case <-client.stopCh:
-						// Client already stopped, no need to log
-					default:
-						log.Printf("Client network write error to %s: %v", client.conn.RemoteAddr(), sendErr)
-					}
-					client.stopOnce.Do(func() {
-						close(client.stopCh)
-					})
-				}
-			}()
+			batch = append(batch, packet)
+			if len(batch) == 1 {
+				resetTimer()
+			}
+			if len(batch) >= dataShards {
+				flushBatch(t.config.FECParityShards)
+			}
+		case <-flushTimer.C:
+			if len(batch) > 0 {
+				flushBatch(1)
+			}
 		}
 	}
 }
@@ -3810,140 +3912,148 @@ func (t *Tunnel) sendPeerInfoAndPunch(client *ClientConnection, peerInfo string)
 // broadcastPeerInfo is no longer used in on-demand P2P mode
 // Connections are established only when needed via handleP2PRequest
 
-// sendPacketWithFEC encodes a packet using FEC and sends all shards
-// Returns error if FEC encoding or sending fails
-func (t *Tunnel) sendPacketWithFEC(conn faketcp.ConnAdapter, packet []byte) error {
+// sendBatchWithFEC encodes multiple packets using FEC and sends all shards.
+// parityShards specifies the number of parity shards for this batch.
+func (t *Tunnel) sendBatchWithFEC(conn faketcp.ConnAdapter, packets [][]byte, parityShards int, encryptFn func([]byte) ([]byte, error)) error {
 	if !t.fecEnabled || t.fec == nil {
-		// FEC not enabled, send packet directly
-		return conn.WritePacket(packet)
+		return errors.New("FEC not enabled")
 	}
-	
-	// Get next session ID
-	sessionID := t.nextFECSessionID()
-	
-	// FEC encode the packet
-	shards, err := t.fec.Encode(packet)
-	if err != nil {
+	if len(packets) == 0 {
+		return nil
+	}
+	if parityShards <= 0 {
+		return errors.New("invalid parity shards")
+	}
+
+	dataShards := len(packets)
+	encPackets := make([][]byte, dataShards)
+	maxLen := 0
+	for i, pkt := range packets {
+		fullPacket, _ := prependPacketType(pkt, PacketTypeData)
+		enc, err := encryptFn(fullPacket)
+		if err != nil {
+			return fmt.Errorf("packet encryption failed: %v", err)
+		}
+		encPackets[i] = enc
+		if len(enc) > maxLen {
+			maxLen = len(enc)
+		}
+	}
+
+	// Each shard starts with 2 bytes length + payload, padded to shardSize
+	shardSize := maxLen + 2
+	shards := make([][]byte, dataShards+parityShards)
+	for i := 0; i < dataShards; i++ {
+		shards[i] = make([]byte, shardSize)
+		binary.BigEndian.PutUint16(shards[i][0:2], uint16(len(encPackets[i])))
+		copy(shards[i][2:], encPackets[i])
+	}
+	for i := dataShards; i < dataShards+parityShards; i++ {
+		shards[i] = make([]byte, shardSize)
+	}
+
+	if err := fec.EncodeShards(shards, dataShards, parityShards); err != nil {
 		return fmt.Errorf("FEC encoding failed: %v", err)
 	}
-	
+
 	// Send each shard with FEC header
-	// FEC header format: [PacketTypeFECShard][sessionID:4][shardIndex:2][totalShards:2][originalSize:4][shard_data]
-	totalShards := len(shards)
-	originalSize := len(packet)
-	
+	// FEC header format: [PacketTypeFECShard][sessionID:4][shardIndex:2][dataShards:2][parityShards:2][shardSize:2][shard_data]
+	sessionID := t.nextFECSessionID()
 	for i, shard := range shards {
-		// Build FEC packet
-		fecPacket := make([]byte, 1+4+2+2+4+len(shard))
+		fecPacket := make([]byte, 1+4+2+2+2+2+len(shard))
 		fecPacket[0] = PacketTypeFECShard
-		
+
 		// Session ID (4 bytes)
 		fecPacket[1] = byte(sessionID >> 24)
 		fecPacket[2] = byte(sessionID >> 16)
 		fecPacket[3] = byte(sessionID >> 8)
 		fecPacket[4] = byte(sessionID)
-		
+
 		// Shard index (2 bytes)
 		fecPacket[5] = byte(i >> 8)
 		fecPacket[6] = byte(i)
-		
-		// Total shards (2 bytes)
-		fecPacket[7] = byte(totalShards >> 8)
-		fecPacket[8] = byte(totalShards)
-		
-		// Original size (4 bytes)
-		fecPacket[9] = byte(originalSize >> 24)
-		fecPacket[10] = byte(originalSize >> 16)
-		fecPacket[11] = byte(originalSize >> 8)
-		fecPacket[12] = byte(originalSize)
-		
+
+		// Data shards (2 bytes)
+		fecPacket[7] = byte(dataShards >> 8)
+		fecPacket[8] = byte(dataShards)
+
+		// Parity shards (2 bytes)
+		fecPacket[9] = byte(parityShards >> 8)
+		fecPacket[10] = byte(parityShards)
+
+		// Shard size (2 bytes)
+		fecPacket[11] = byte(shardSize >> 8)
+		fecPacket[12] = byte(shardSize)
+
 		// Shard data
 		copy(fecPacket[13:], shard)
-		
-		// Send the FEC packet
+
 		if err := conn.WritePacket(fecPacket); err != nil {
-			// Even if one shard fails, continue sending others
-			// FEC can handle missing shards
-			log.Printf("Failed to send FEC shard %d/%d: %v", i+1, totalShards, err)
+			log.Printf("Failed to send FEC shard %d/%d: %v", i+1, len(shards), err)
 		}
 	}
-	
+
 	return nil
 }
 
-// processFECShard handles a received FEC shard and attempts to reconstruct the original packet
-// Returns the reconstructed packet if complete, or nil if more shards are needed
-func (t *Tunnel) processFECShard(peerAddr string, fecPacket []byte) ([]byte, error) {
-	// FEC header: sessionID(4) + shardIndex(2) + totalShards(2) + originalSize(4) = 12 bytes minimum
+// processFECShard handles a received FEC shard and attempts to reconstruct original packets.
+// Returns reconstructed packets if complete, or nil if more shards are needed.
+func (t *Tunnel) processFECShard(peerAddr string, fecPacket []byte) ([][]byte, error) {
+	// FEC header: sessionID(4) + shardIndex(2) + dataShards(2) + parityShards(2) + shardSize(2) = 12 bytes minimum
 	if len(fecPacket) < 12 {
 		return nil, errors.New("FEC packet too short")
 	}
-	
+
 	// Parse FEC header (PacketTypeFECShard already stripped by caller)
 	sessionID := uint32(fecPacket[0])<<24 | uint32(fecPacket[1])<<16 | uint32(fecPacket[2])<<8 | uint32(fecPacket[3])
 	shardIndex := int(fecPacket[4])<<8 | int(fecPacket[5])
-	totalShards := int(fecPacket[6])<<8 | int(fecPacket[7])
-	originalSize := int(fecPacket[8])<<24 | int(fecPacket[9])<<16 | int(fecPacket[10])<<8 | int(fecPacket[11])
+	dataShards := int(fecPacket[6])<<8 | int(fecPacket[7])
+	parityShards := int(fecPacket[8])<<8 | int(fecPacket[9])
+	shardSize := int(fecPacket[10])<<8 | int(fecPacket[11])
 	shardData := fecPacket[12:]
-	
-	// Create unique session key using peer address and session ID
-	sessionKey := fmt.Sprintf("%s:%d", peerAddr, sessionID)
-	
-	// Validate
-	if totalShards != t.fec.TotalShards() {
-		return nil, fmt.Errorf("FEC total shards mismatch: expected %d, got %d", t.fec.TotalShards(), totalShards)
+
+	if dataShards <= 0 || parityShards <= 0 {
+		return nil, fmt.Errorf("FEC shard counts invalid: data=%d parity=%d", dataShards, parityShards)
 	}
-	
+	if shardSize <= 2 {
+		return nil, fmt.Errorf("FEC shard size invalid: %d", shardSize)
+	}
+
+	totalShards := dataShards + parityShards
 	if shardIndex >= totalShards {
 		return nil, fmt.Errorf("FEC shard index out of range: %d >= %d", shardIndex, totalShards)
 	}
-	
-	// Validate original size is reasonable (prevent memory exhaustion attacks)
-	// Maximum reasonable packet size is MTU + encryption overhead + some margin
-	const maxReasonablePacketSize = 65536 // 64KB should be more than enough
-	if originalSize <= 0 || originalSize > maxReasonablePacketSize {
-		return nil, fmt.Errorf("FEC original size invalid: %d (must be 1-%d)", originalSize, maxReasonablePacketSize)
+	if len(shardData) != shardSize {
+		return nil, fmt.Errorf("FEC shard size mismatch: expected %d, got %d", shardSize, len(shardData))
 	}
-	
-	// Validate shard data is not empty
-	if len(shardData) == 0 {
-		return nil, fmt.Errorf("FEC shard data is empty")
-	}
-	
+
+	// Create unique session key using peer address and session ID
+	sessionKey := fmt.Sprintf("%s:%d", peerAddr, sessionID)
+
 	// Get or create FEC session
 	t.fecRecvMux.Lock()
 	session, exists := t.fecRecvSessions[sessionKey]
 	if !exists {
-		// Create new session
 		session = &fecRecvSession{
 			shards:        make([][]byte, totalShards),
 			shardPresent:  make([]bool, totalShards),
-			dataShards:    t.fec.DataShards(),
-			parityShards:  t.fec.ParityShards(),
+			dataShards:    dataShards,
+			parityShards:  parityShards,
 			totalShards:   totalShards,
 			receivedCount: 0,
 			lastUpdate:    time.Now(),
-			originalSize:  originalSize,
-			expectedShardSize: len(shardData),
+			expectedShardSize: shardSize,
 		}
 		t.fecRecvSessions[sessionKey] = session
 	}
-	
+
 	// Validate shard consistency
-	if session.originalSize != originalSize {
+	if session.dataShards != dataShards || session.parityShards != parityShards || session.expectedShardSize != shardSize {
 		t.fecRecvMux.Unlock()
-		return nil, fmt.Errorf("FEC session %s: original size mismatch (%d vs %d)", sessionKey, session.originalSize, originalSize)
+		return nil, fmt.Errorf("FEC session %s: shard metadata mismatch", sessionKey)
 	}
-	
+
 	t.fecRecvMux.Unlock()
-	
-	// Validate shard size consistency
-	if session.expectedShardSize != 0 && len(shardData) != session.expectedShardSize {
-		t.fecRecvMux.Lock()
-		delete(t.fecRecvSessions, sessionKey)
-		t.fecRecvMux.Unlock()
-		return nil, fmt.Errorf("FEC session %s: shard size mismatch (%d vs %d)", sessionKey, len(shardData), session.expectedShardSize)
-	}
 
 	// Add shard to session
 	if !session.shardPresent[shardIndex] {
@@ -3953,41 +4063,52 @@ func (t *Tunnel) processFECShard(peerAddr string, fecPacket []byte) ([]byte, err
 		session.receivedCount++
 		session.lastUpdate = time.Now()
 	}
-	
+
 	// Check if we can reconstruct
 	if session.receivedCount >= session.dataShards {
-		// Attempt to decode
-		decodedData, err := t.fec.Decode(session.shards, session.shardPresent)
-		if err != nil {
-			// Suppress logs for expected incomplete or unrecoverable FEC sessions during packet loss
-			if err == fec.ErrIncomplete {
-				return nil, nil // Need more shards, not an error
+		// Mark missing shards as nil
+		for i := 0; i < session.totalShards; i++ {
+			if !session.shardPresent[i] {
+				session.shards[i] = nil
 			}
-			if err == fec.ErrUnrecoverable {
-				// We've received enough total shards but too many data shards are missing
-				// for the XOR algorithm to handle. Clean up and move on quietly.
+		}
+
+		// Attempt to reconstruct
+		if err := fec.ReconstructShards(session.shards, session.dataShards, session.parityShards); err != nil {
+			if session.receivedCount == session.totalShards {
+				// Unrecoverable
 				t.fecRecvMux.Lock()
 				delete(t.fecRecvSessions, sessionKey)
 				t.fecRecvMux.Unlock()
-				return nil, nil 
+				return nil, nil
 			}
-			return nil, fmt.Errorf("FEC decoding failed: %v", err)
+			return nil, nil // Need more shards
 		}
-		
-		// Trim to original size
-		if len(decodedData) > originalSize {
-			decodedData = decodedData[:originalSize]
+
+		// Extract data packets
+		var packets [][]byte
+		for i := 0; i < session.dataShards; i++ {
+			shard := session.shards[i]
+			if len(shard) < 2 {
+				continue
+			}
+			pktLen := int(binary.BigEndian.Uint16(shard[0:2]))
+			if pktLen <= 0 || pktLen > len(shard)-2 {
+				continue
+			}
+			packet := make([]byte, pktLen)
+			copy(packet, shard[2:2+pktLen])
+			packets = append(packets, packet)
 		}
-		
+
 		// Clean up session
 		t.fecRecvMux.Lock()
 		delete(t.fecRecvSessions, sessionKey)
 		t.fecRecvMux.Unlock()
-		
-		return decodedData, nil
+
+		return packets, nil
 	}
-	
-	// Need more shards
+
 	return nil, nil
 }
 
