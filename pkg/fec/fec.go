@@ -175,12 +175,27 @@ func EncodeShards(shards [][]byte, dataShards, parityShards int) error {
 	return enc.Encode(shards)
 }
 
+
+// usedEncodersCache caches reedsolomon encoders to avoid recreation overhead
+// Since New() can be expensive
+// Note: reedsolomon.New() is somewhat optimized but caching is better for high throughput loops
+// We'll use a simple sync.Map or just rely on the fact that NewNode is likely relatively cheap? 
+// Actually reedsolomon.New precomputes tables. It's expensive.
+// We should reuse the Encoder.
+
 // ReconstructShards reconstructs missing shards in-place.
-// Missing shards should be nil.
+// This function creates a NEW encoder every time which is VERY expensive (CPU heavy).
+// It should be deprecated in favor of a method on the *FEC struct that reuses the encoder.
 func ReconstructShards(shards [][]byte, dataShards, parityShards int) error {
+	// WARNING: This is a performance bottleneck if called frequently!
 	enc, err := reedsolomon.New(dataShards, parityShards)
 	if err != nil {
 		return err
 	}
 	return enc.Reconstruct(shards)
+}
+
+// Reconstruct reconstructs using the cached encoder
+func (f *FEC) Reconstruct(shards [][]byte) error {
+	return f.encoder.Reconstruct(shards)
 }

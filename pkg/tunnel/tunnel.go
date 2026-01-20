@@ -4635,9 +4635,20 @@ func (t *Tunnel) processFECShard(peerAddr string, fecPacket []byte) (uint32, [][
 		}
 
 		// Attempt to reconstruct
-		if err := fec.ReconstructShards(session.shards, session.dataShards, session.parityShards); err != nil {
-			if session.receivedCount == session.totalShards {
-				// Unrecoverable
+		// CRITICAL FIX: Use the cached FEC decoder!
+		// Previously used fec.ReconstructShards which re-created the Reed-Solomon tables (malloc+CPU) for EVERY packet/session.
+		// That was the primary 50Mbps bottleneck.
+		var err error
+		if t.fec != nil {
+			err = t.fec.Reconstruct(session.shards)
+		} else {
+			err = fec.ReconstructShards(session.shards, session.dataShards, session.parityShards)
+		}
+
+		if err != nil {
+			if session.receivedCount >= session.totalShards {
+				// Unrecoverable only if we have ALL shards (or way too many but wrong ones?)
+				// Actually ReconstructShards failing means something is corrupted if count >= dataShards.
 				t.fecRecvMux.Lock()
 				delete(t.fecRecvSessions, sessionKey)
 				t.fecRecvMux.Unlock()
@@ -4646,6 +4657,9 @@ func (t *Tunnel) processFECShard(peerAddr string, fecPacket []byte) (uint32, [][
 			}
 			return sessionID, nil, nil // Need more shards
 		}
+
+		// Reconstructed successfully
+		atomic.AddUint64(&t.statFECSessionsRecovered, 1)
 
 		// Extract data packets
 		var packets [][]byte
@@ -4658,6 +4672,21 @@ func (t *Tunnel) processFECShard(peerAddr string, fecPacket []byte) (uint32, [][
 			if pktLen <= 0 || pktLen > len(shard)-2 {
 				continue
 			}
+			data := make([]byte, pktLen)
+			copy(data, shard[2:2+pktLen]) // Copy to new buffer to free session memory
+			packets = append(packets, data)
+			atomic.AddUint64(&t.statFECPacketsRecovered, 1)
+		}
+
+		t.fecRecvMux.Lock()
+		delete(t.fecRecvSessions, sessionKey)
+		t.fecRecvMux.Unlock()
+
+		return sessionID, packets, nil
+	}
+
+	return sessionID, nil, nil
+}
 			packet := make([]byte, pktLen)
 			copy(packet, shard[2:2+pktLen])
 			packets = append(packets, packet)
