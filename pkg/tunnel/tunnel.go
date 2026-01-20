@@ -1924,8 +1924,6 @@ func (t *Tunnel) netReader() {
 			}
 			continue
 		}
-			continue
-		}
 
 		// Decrypt if cipher is available (for non-FEC packets)
 		decryptedPacket, err := t.decryptPacket(packet)
