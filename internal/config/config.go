@@ -137,6 +137,9 @@ func LoadConfig(filename string) (*Config, error) {
 	if config.RecvQueueSize == 0 {
 		config.RecvQueueSize = 10000 // Increased default to handle high bandwidth
 	}
+	if config.SendWorkers == 0 {
+		config.SendWorkers = 4
+	}
 	if config.MaxClients == 0 {
 		config.MaxClients = 100
 	}

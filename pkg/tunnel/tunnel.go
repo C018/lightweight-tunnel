@@ -292,11 +292,21 @@ type Tunnel struct {
 	authMux          sync.RWMutex      // Protects authenticated flag
 	authResponseChan chan error        // Channel for receiving auth response (client mode)
 
-	// Work queue for parallel FEC processing
+	// Work queue for parallel FEC processing (Send side)
 	fecWorkQueue chan *fecBatchWork
 	
 	// Work queue for parallel Decryption (Receive side)
 	fecDecryptionQueue chan [][]byte
+
+	// Work queue for parallel FEC Ingress/Reconstruction (Receive side)
+	// Decouples socket reading from heavy RS reconstruction math
+	fecIngressQueue chan *fecIngressWork
+}
+
+type fecIngressWork struct {
+	remoteAddr string
+	packet     []byte
+	client     *ClientConnection // Optional: for server mode to track per-client stats/cipher
 }
 
 // fecBatchWork represents a batch of packets to be processed by workers
@@ -909,33 +919,38 @@ func (t *Tunnel) Start() error {
 
 		// Start client mode packet processing
 		if netReaderStarted {
-			// +1 main netWriter + 3 groups of workers (Send, FEC, Decrypt) + default ones
-			// TunWrites are now parallelized as well
-			t.wg.Add(3 + t.config.SendWorkers*3) 
+			// +1 main netWriter + 4 groups of workers (Send, FEC Send, FEC Ingress, Decrypt) + default ones
+			t.wg.Add(3 + t.config.SendWorkers*4) 
 			go t.tunReader()
 			
-			// Parallelize TUN writes to overcome syscall bottleneck
+			// Parallelize TUN writes
 			for i := 0; i < t.config.SendWorkers; i++ {
 				go t.tunWriter()
 			}
 			
-			// Parallelize Decryption workers (Wait-free model)
+			// Parallelize Decryption workers
 			for i := 0; i < t.config.SendWorkers; i++ {
 				go t.fecDecryptionWorker()
 			}
-
-			go t.netWriter() // Reverted to single netWriter (dispatcher)
 			
-			// Start multiple FEC processing workers
+			// Parallelize FEC Ingress workers (Reconstruction)
+			// This is CRITICAL: Moves math out of the socket read loop
+			for i := 0; i < t.config.SendWorkers; i++ {
+				go t.fecIngressWorker()
+			}
+
+			go t.netWriter() 
+			
+			// Start multiple FEC Send workers
 			for i := 0; i < t.config.SendWorkers; i++ {
 				go t.fecWorker()
 			}
 		} else {
 			// TunWrites + FEC workers
-			t.wg.Add(4 + t.config.SendWorkers*3)
+			t.wg.Add(4 + t.config.SendWorkers*4)
 			go t.tunReader()
 			
-			// Parallelize TUN writes to overcome syscall bottleneck
+			// Parallelize TUN writes
 			for i := 0; i < t.config.SendWorkers; i++ {
 				go t.tunWriter()
 			}
@@ -943,6 +958,11 @@ func (t *Tunnel) Start() error {
 			// Parallelize Decryption workers
 			for i := 0; i < t.config.SendWorkers; i++ {
 				go t.fecDecryptionWorker()
+			}
+			
+			// Parallelize FEC Ingress workers
+			for i := 0; i < t.config.SendWorkers; i++ {
+				go t.fecIngressWorker()
 			}
 
 			go t.netReader()
@@ -1926,24 +1946,14 @@ func (t *Tunnel) netReader() {
 		// FEC shards are NOT encrypted themselves - they contain pieces of encrypted data
 		if len(packet) > 0 && packet[0] == PacketTypeFECShard {
 			if t.fecEnabled {
-				sessionID, reconstructedPackets, err := t.processFECShard(t.config.RemoteAddr, packet[1:])
-				if err != nil {
-					log.Printf("FEC shard processing error: %v", err)
-					continue
-				}
-
-				var batch [][]byte
-				t.handleRecoveredBatch(t.config.RemoteAddr, sessionID, reconstructedPackets, func(reconstructedPacket []byte) {
-					batch = append(batch, reconstructedPacket)
-				})
-
-				if len(batch) > 0 {
-					select {
-					case t.fecDecryptionQueue <- batch:
-					default:
-						// Avoid blocking netReader if workers are slow
-						atomic.AddUint64(&t.statQueueDropRecv, uint64(len(batch)))
-					}
+				// Offload to worker pool
+				select {
+				case t.fecIngressQueue <- &fecIngressWork{
+					remoteAddr: t.config.RemoteAddr,
+					packet:     packet[1:],
+				}:
+				default:
+					atomic.AddUint64(&t.statQueueDropRecv, 1)
 				}
 			}
 			continue
@@ -2333,26 +2343,18 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 		// FEC shards are NOT encrypted themselves - they contain pieces of encrypted data
 		if len(packet) > 0 && packet[0] == PacketTypeFECShard {
 			if t.fecEnabled {
-				sessionID, reconstructedPackets, err := t.processFECShard(client.conn.RemoteAddr().String(), packet[1:])
-				if err != nil {
-					log.Printf("FEC shard processing error from client %s: %v", client.conn.RemoteAddr(), err)
-					continue
+				// Offload to worker pool - do NOT process in this hot loop
+				// Copy packet to decouple from read buffer if needed (or assume ownership)
+				// Here packet is already a copy from ReadPacket, so passing it is safe.
+				select {
+				case t.fecIngressQueue <- &fecIngressWork{
+					remoteAddr: client.conn.RemoteAddr().String(),
+					packet:     packet[1:], // Strip type header
+					client:     client,
+				}:
+				default:
+					atomic.AddUint64(&t.statQueueDropRecv, 1) // Using same drop stat for simplicity
 				}
-
-				t.handleRecoveredBatch(client.conn.RemoteAddr().String(), sessionID, reconstructedPackets, func(reconstructedPacket []byte) {
-					decryptedPacket, usedCipher, gen, err := t.decryptPacketFromClient(client, reconstructedPacket)
-					if err != nil {
-						log.Printf("FEC reconstructed packet decryption error from %s: %v", client.conn.RemoteAddr(), err)
-						return
-					}
-					if usedCipher != nil {
-						client.setCipherWithGen(usedCipher, gen)
-					}
-					if !t.handleClientPacket(client, decryptedPacket) {
-						return
-					}
-				})
-				continue
 			}
 			continue
 		} else {
@@ -4415,6 +4417,51 @@ func (t *Tunnel) fecWorker() {
 					time.Sleep(pacing)
 				}
 			}()
+		}
+	}
+}
+
+// fecIngressWorker processes incoming FEC shards (Reconstruction)
+// This runs in a pool to keep the main read loop fast
+func (t *Tunnel) fecIngressWorker() {
+	defer t.wg.Done()
+	
+	for {
+		select {
+		case <-t.stopCh:
+			return
+		case work := <-t.fecIngressQueue:
+			sessionID, reconstructedPackets, err := t.processFECShard(work.remoteAddr, work.packet)
+			if err != nil {
+				continue
+			}
+
+			// If we got reconstructed packets, we need to handle them
+			if len(reconstructedPackets) > 0 {
+				t.handleRecoveredBatch(work.remoteAddr, sessionID, reconstructedPackets, func(reconstructedPacket []byte) {
+					if work.client != nil {
+						// Server mode: Client specific logic
+						decryptedPacket, usedCipher, gen, err := t.decryptPacketFromClient(work.client, reconstructedPacket)
+						if err != nil {
+							return
+						}
+						
+						if usedCipher != nil {
+							work.client.setCipherWithGen(usedCipher, gen)
+						}
+						
+						t.handleClientPacket(work.client, decryptedPacket)
+					} else {
+						// Client mode: Tunnel logic
+						// Send to decryption queue
+						select {
+						case t.fecDecryptionQueue <- [][]byte{reconstructedPacket}:
+						default:
+							atomic.AddUint64(&t.statQueueDropRecv, 1)
+						}
+					}
+				})
+			}
 		}
 	}
 }
