@@ -4353,9 +4353,11 @@ func (t *Tunnel) sendBatchWithFEC(conn faketcp.ConnAdapter, packets [][]byte, pa
 		if err := conn.WritePacket(fecPacket); err != nil {
 			log.Printf("Failed to send FEC shard %d/%d: %v", i+1, len(shards), err)
 		}
-		if pacing := faketcp.GetTuning().WritePacingMinDelay; pacing > 0 {
-			time.Sleep(pacing)
-		}
+	}
+
+	// Apply pacing once per batch instead of per shard to improve throughput
+	if pacing := faketcp.GetTuning().WritePacingMinDelay; pacing > 0 {
+		time.Sleep(pacing)
 	}
 
 	return nil
