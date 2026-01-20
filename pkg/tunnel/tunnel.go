@@ -1886,7 +1886,10 @@ func (t *Tunnel) netReader() {
 					payload := decryptedPacket[1:]
 
 					if packetType == PacketTypeData {
-						if !enqueueWithPolicy(t.recvQueue, payload, t.stopCh, t.fecEnabled) {
+						// CRITICAL FIX: Never block on receive queue to prevent infinite backlog
+						// ROOT CAUSE: When block=true (t.fecEnabled), packets wait indefinitely for queue space
+						// This caused UDP test to take 30s instead of 10s - packets kept accumulating
+						if !enqueueWithPolicy(t.recvQueue, payload, t.stopCh, false) {
 							atomic.AddUint64(&t.statQueueDropRecv, 1)
 							select {
 							case <-t.stopCh:
@@ -1918,8 +1921,10 @@ func (t *Tunnel) netReader() {
 
 		switch packetType {
 		case PacketTypeData:
-			// Queue for TUN device
-			if !enqueueWithPolicy(t.recvQueue, payload, t.stopCh, t.fecEnabled) {
+			// CRITICAL FIX: Never block on receive queue
+			// ROOT CAUSE: block=t.fecEnabled caused indefinite waiting when queue full
+			// Result: UDP test took 30s instead of 10s due to backlog accumulation
+			if !enqueueWithPolicy(t.recvQueue, payload, t.stopCh, false) {
 				atomic.AddUint64(&t.statQueueDropRecv, 1)
 				select {
 				case <-t.stopCh:
