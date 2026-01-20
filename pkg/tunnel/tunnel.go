@@ -441,7 +441,8 @@ func (t *Tunnel) handleRecoveredBatch(peerAddr string, sessionID uint32, packets
 	if len(packets) == 0 {
 		return
 	}
-	const reorderTimeout = 200 * time.Millisecond
+	const reorderTimeout = 500 * time.Millisecond
+	const reorderWindowSize = 64 // Allow up to 64 out-of-order batches
 
 	t.fecReorderMux.Lock()
 	buf := t.fecReorderBufs[peerAddr]
@@ -465,49 +466,74 @@ func (t *Tunnel) handleRecoveredBatch(peerAddr string, sessionID uint32, packets
 		return
 	}
 
-	buf.pending[sessionID] = packets
-	buf.lastUpdate = time.Now()
-
-	var toDeliver [][]byte
-	for {
-		pkts, ok := buf.pending[buf.next]
-		if !ok {
-			break
+	// Sliding window delivery: deliver if within window, regardless of gaps
+	windowEnd := buf.next + reorderWindowSize
+	if sessionID >= buf.next && sessionID < windowEnd {
+		// Within window: store and deliver immediately
+		buf.pending[sessionID] = packets
+		buf.lastUpdate = time.Now()
+	} else if sessionID < buf.next {
+		// Late batch: allow UDP packets through, drop TCP
+		atomic.AddUint64(&t.statFECLateBatchDrop, 1)
+		t.fecReorderMux.Unlock()
+		for _, pkt := range packets {
+			if isUDPPacket(pkt) {
+				deliver(pkt)
+			}
 		}
-		delete(buf.pending, buf.next)
-		buf.next++
-		toDeliver = append(toDeliver, pkts...)
+		return
+	} else {
+		// Beyond window: skip forward and deliver
+		gapSize := sessionID - buf.next
+		atomic.AddUint64(&t.statFECGapSkip, uint64(gapSize))
+		buf.next = sessionID
+		buf.pending[sessionID] = packets
+		buf.lastUpdate = time.Now()
+		// Clear old pending entries
+		for sid := range buf.pending {
+			if sid < buf.next {
+				delete(buf.pending, sid)
+			}
+		}
 	}
-	if len(toDeliver) > 0 {
-		buf.gapSince = time.Time{}
+
+	// Deliver all pending packets within window (allow gaps)
+	var toDeliver [][]byte
+	for sid := buf.next; sid < windowEnd; sid++ {
+		if pkts, ok := buf.pending[sid]; ok {
+			toDeliver = append(toDeliver, pkts...)
+			delete(buf.pending, sid)
+			if sid == buf.next {
+				buf.next++
+			}
+		}
 	}
-	if len(toDeliver) == 0 && len(buf.pending) > 0 {
+
+	// Timeout-based cleanup: advance next pointer if gap persists too long
+	if len(buf.pending) > 0 {
 		if buf.gapSince.IsZero() {
 			buf.gapSince = time.Now()
-		}
-		if time.Since(buf.gapSince) > reorderTimeout {
-			// Skip missing sessions and resync to the smallest available session ID
-			var min uint32
-			first := true
+		} else if time.Since(buf.gapSince) > reorderTimeout {
+			// Find next available session after gap timeout
+			var minAvailable uint32
+			found := false
 			for sid := range buf.pending {
-				if first || sid < min {
-					min = sid
-					first = false
+				if sid > buf.next && (!found || sid < minAvailable) {
+					minAvailable = sid
+					found = true
 				}
 			}
-			if !first && min > buf.next {
-				atomic.AddUint64(&t.statFECGapSkip, uint64(min-buf.next))
-			}
-			buf.next = min
-			buf.gapSince = time.Time{}
-			if pkts, ok := buf.pending[buf.next]; ok {
-				delete(buf.pending, buf.next)
-				buf.next++
-				toDeliver = append(toDeliver, pkts...)
+			if found {
+				atomic.AddUint64(&t.statFECGapSkip, uint64(minAvailable-buf.next))
+				buf.next = minAvailable
+				buf.gapSince = time.Time{}
 			}
 		}
+	} else {
+		buf.gapSince = time.Time{}
 	}
 
+	// Cleanup old buffer if idle
 	if len(buf.pending) == 0 && time.Since(buf.lastUpdate) > 5*reorderTimeout {
 		delete(t.fecReorderBufs, peerAddr)
 	}
@@ -2046,7 +2072,7 @@ func (t *Tunnel) netWriter() {
 	}
 
 	// FEC enabled: batch packets within a short window for cross-packet recovery
-	const fecBatchTimeout = 10 * time.Millisecond
+	const fecBatchTimeout = 50 * time.Millisecond
 	dataShards := t.config.FECDataShards
 	batch := make([][]byte, 0, dataShards)
 	flushTimer := time.NewTimer(fecBatchTimeout)
@@ -2453,7 +2479,7 @@ func (t *Tunnel) clientNetWriter(client *ClientConnection) {
 	}
 
 	// FEC enabled: batch packets within a short window for cross-packet recovery
-	const fecBatchTimeout = 10 * time.Millisecond
+	const fecBatchTimeout = 50 * time.Millisecond
 	dataShards := t.config.FECDataShards
 	batch := make([][]byte, 0, dataShards)
 	flushTimer := time.NewTimer(fecBatchTimeout)
