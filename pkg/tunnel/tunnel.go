@@ -908,9 +908,16 @@ func (t *Tunnel) Start() error {
 
 		// Start client mode packet processing
 		if netReaderStarted {
-			t.wg.Add(3 + t.config.SendWorkers) // +1 main netWriter + N workers
+			// +1 main netWriter + 3 groups of workers (Send, FEC, Decrypt) + default ones
+			// TunWrites are now parallelized as well
+			t.wg.Add(3 + t.config.SendWorkers*2) 
 			go t.tunReader()
-			go t.tunWriter()
+			
+			// Parallelize TUN writes to overcome syscall bottleneck
+			for i := 0; i < t.config.SendWorkers; i++ {
+				go t.tunWriter()
+			}
+
 			go t.netWriter() // Reverted to single netWriter (dispatcher)
 			
 			// Start multiple FEC processing workers
@@ -918,9 +925,15 @@ func (t *Tunnel) Start() error {
 				go t.fecWorker()
 			}
 		} else {
-			t.wg.Add(4 + t.config.SendWorkers)
+			// TunWrites + FEC workers
+			t.wg.Add(4 + t.config.SendWorkers*2)
 			go t.tunReader()
-			go t.tunWriter()
+			
+			// Parallelize TUN writes to overcome syscall bottleneck
+			for i := 0; i < t.config.SendWorkers; i++ {
+				go t.tunWriter()
+			}
+
 			go t.netReader()
 			go t.netWriter() // Reverted to single netWriter (dispatcher)
 			
