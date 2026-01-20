@@ -161,7 +161,10 @@ func (f *FEC) ParityShards() int {
 func (f *FEC) TotalShards() int {
 	return f.dataShards + f.parityShards
 }
-
+// EncodeShards uses the pre-configured encoder to encode shards.
+func (f *FEC) EncodeShards(shards [][]byte) error {
+	return f.encoder.Encode(shards)
+}
 // EncodeShards encodes data+parity shards using Reed-Solomon.
 // shards length must be dataShards+parityShards and each shard must be the same size.
 func EncodeShards(shards [][]byte, dataShards, parityShards int) error {

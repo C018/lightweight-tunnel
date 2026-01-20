@@ -4352,7 +4352,7 @@ func (t *Tunnel) fecWorker() {
 					shards[i] = make([]byte, shardSize)
 				}
 
-				if err := t.fec.EncodeShards(shards, dataShards, work.parityShards); err != nil {
+				if err := t.fec.EncodeShards(shards); err != nil {
 					log.Printf("FEC encode error: %v", err)
 					return
 				}
