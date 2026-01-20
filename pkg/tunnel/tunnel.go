@@ -4640,13 +4640,22 @@ func (t *Tunnel) processFECShard(peerAddr string, fecPacket []byte) (uint32, [][
 		}
 
 		// Attempt to reconstruct
-		// CRITICAL FIX: Use the cached FEC decoder!
-		// Previously used fec.ReconstructShards which re-created the Reed-Solomon tables (malloc+CPU) for EVERY packet/session.
-		// That was the primary 50Mbps bottleneck.
 		var err error
+		
+		// Optimization: Use cached encoder ONLY if parameters match
+		// This handles the case where remote peer has different FEC config than local
+		useCached := false
 		if t.fec != nil {
+			if t.fec.DataShards() == session.dataShards && t.fec.ParityShards() == session.parityShards {
+				useCached = true
+			}
+		}
+
+		if useCached {
 			err = t.fec.Reconstruct(session.shards)
 		} else {
+			// Fallback to creating new encoder/decoder (slower, but correct)
+			// This happens if config mismatches between peers
 			err = fec.ReconstructShards(session.shards, session.dataShards, session.parityShards)
 		}
 
