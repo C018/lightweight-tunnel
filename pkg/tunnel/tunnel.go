@@ -58,7 +58,7 @@ const (
 	P2PMaxBackoffSeconds           = 32 // Maximum backoff delay in seconds
 
 	// Queue management constants
-	QueueSendTimeout = 100 * time.Millisecond // Timeout for queue send operations to handle temporary congestion
+	QueueSendTimeout = 200 * time.Millisecond // Timeout for queue send operations to handle temporary congestion (increased for high-latency networks)
 
 	// Connection health constants
 	// IdleConnectionTimeout is the maximum time without receiving packets before considering connection dead.

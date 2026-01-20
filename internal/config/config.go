@@ -68,8 +68,8 @@ func DefaultConfig() *Config {
 		FECParityShards:     2,
 		Timeout:             30,
 		KeepaliveInterval:   5, // Reduced from 10 to 5 seconds for faster detection of connection issues
-		SendQueueSize:       10000, // Increased to 10000 to prevent queue full errors during high bandwidth testing
-		RecvQueueSize:       10000, // Increased to 10000 to handle burst traffic during iperf3 testing
+		SendQueueSize:       1000, // Balanced for latency and throughput (reduced from 10000 to avoid bufferbloat)
+		RecvQueueSize:       1000, // Balanced for latency and throughput (reduced from 10000 to avoid bufferbloat)
 		TunName:             "",
 		Routes:              []string{},
 		ConfigPushInterval:  0,

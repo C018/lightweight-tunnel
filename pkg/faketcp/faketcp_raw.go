@@ -346,6 +346,7 @@ func (c *ConnRaw) WritePacket(data []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	segmentCount := (len(data) + maxSegment - 1) / maxSegment
 	for offset := 0; offset < len(data); offset += maxSegment {
 		end := offset + maxSegment
 		if end > len(data) {
@@ -361,8 +362,15 @@ func (c *ConnRaw) WritePacket(data []byte) error {
 		}
 
 		c.seqNum += uint32(len(segment))
-		if tunables.WritePacingMinDelay > 0 {
-			time.Sleep(tunables.WritePacingMinDelay)
+		// Apply pacing only if configured and not the last segment
+		// This helps reduce burst packet loss in high-latency networks
+		if tunables.WritePacingMinDelay > 0 && offset+maxSegment < len(data) {
+			// Adaptive pacing: add extra delay for larger bursts
+			if segmentCount > 3 {
+				time.Sleep(tunables.WritePacingMinDelay * 2)
+			} else {
+				time.Sleep(tunables.WritePacingMinDelay)
+			}
 		}
 	}
 
