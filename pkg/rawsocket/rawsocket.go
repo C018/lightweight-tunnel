@@ -53,6 +53,11 @@ func NewRawSocket(localIP net.IP, localPort uint16, remoteIP net.IP, remotePort 
 		return nil, fmt.Errorf("failed to set non-blocking: %v", err)
 	}
 
+	// Increase socket buffers to 4MB to handle high-throughput bursts (e.g. FEC batches)
+	// Ignore errors as some systems might restrict max buffer size
+	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 4*1024*1024)
+	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, 4*1024*1024)
+
 	// Bind to local address if server
 	if isServer && localIP != nil {
 		addr := syscall.SockaddrInet4{
