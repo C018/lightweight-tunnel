@@ -48,6 +48,7 @@ const (
 	IPv4SrcIPOffset  = 12
 	IPv4DstIPOffset  = 16
 	IPv4MinHeaderLen = 20
+	IPv4ProtocolOffset = 9
 
 	// P2P timing constants
 	P2PRegistrationDelay           = 100 * time.Millisecond // Delay to ensure peer registration completes
