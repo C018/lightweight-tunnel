@@ -45,12 +45,14 @@ type Tuning struct {
 	ListenerQueueSize   int           // pending accept queue length
 	HandshakeMaxErrors  int           // max non-timeout handshake read errors before giving up
 	WritePacingMinDelay time.Duration // optional pacing delay between segments to reduce burst loss
+	MaxSegmentSize      int           // max payload bytes per fake TCP segment
 }
 
 var tunables = Tuning{
 	ListenerQueueSize:   8,
 	HandshakeMaxErrors:  2,
 	WritePacingMinDelay: 0,
+	MaxSegmentSize:      1400,
 }
 
 // SetTuning applies runtime tuning (zero or negative values keep defaults).
@@ -64,6 +66,14 @@ func SetTuning(t Tuning) {
 	if t.WritePacingMinDelay > 0 {
 		tunables.WritePacingMinDelay = t.WritePacingMinDelay
 	}
+	if t.MaxSegmentSize > 0 {
+		tunables.MaxSegmentSize = t.MaxSegmentSize
+	}
+}
+
+// GetTuning returns the current tuning values.
+func GetTuning() Tuning {
+	return tunables
 }
 
 // TCPHeader represents a minimal TCP header
@@ -395,7 +405,10 @@ func (c *Conn) WritePacket(data []byte) error {
 	}
 
 	// Segment data by typical MSS to look like TCP segments
-	const defaultMSS = 1460
+	maxSegment := tunables.MaxSegmentSize
+	if maxSegment <= 0 || maxSegment > MaxPayloadSize {
+		maxSegment = MaxPayloadSize
+	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -405,7 +418,7 @@ func (c *Conn) WritePacket(data []byte) error {
 	for sent < total {
 		// Build header for this segment
 		remaining := total - sent
-		segLen := defaultMSS
+		segLen := maxSegment
 		if remaining < segLen {
 			segLen = remaining
 		}

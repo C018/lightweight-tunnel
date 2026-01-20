@@ -46,6 +46,8 @@ func main() {
 	enableXDP := flag.Bool("xdp", true, "Enable eBPF/XDP-style fast path classification to reduce CPU cost")
 	enableKernelTune := flag.Bool("kernel-tune", true, "Enable kernel tuning (TFO/BBR2) on startup")
 	encryptAfterAuth := flag.Bool("encrypt-after-auth", false, "Skip per-packet encryption after authentication (lower CPU, assumes trusted network)")
+	faketcpPacingUs := flag.Int("faketcp-pacing-us", 0, "Minimum delay between fake TCP segments in microseconds (0=auto/off)")
+	faketcpMaxSeg := flag.Int("faketcp-max-seg", 0, "Max payload bytes per fake TCP segment (0=auto)")
 	showVersion := flag.Bool("v", false, "Show version")
 	generateConfig := flag.String("g", "", "Generate example config file")
 	// TLS flags removed: TLS over the UDP fake-TCP transport is not supported.
@@ -110,6 +112,8 @@ func main() {
 			EnableXDP:           *enableXDP,
 			EnableKernelTune:    *enableKernelTune,
 			EncryptAfterAuth:    *encryptAfterAuth,
+			FakeTCPWritePacingUs: *faketcpPacingUs,
+			FakeTCPMaxSegment:    *faketcpMaxSeg,
 		}
 	}
 

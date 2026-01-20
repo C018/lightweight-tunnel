@@ -518,6 +518,28 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 	// Apply kernel-level optimizations (best effort)
 	applyKernelTunings(cfg.EnableKernelTune)
 
+	// Apply FakeTCP pacing to reduce burst loss in raw socket mode
+	pacingUs := cfg.FakeTCPWritePacingUs
+	maxSegment := cfg.FakeTCPMaxSegment
+	if maxSegment <= 0 && cfg.FECDataShards > 0 && cfg.FECParityShards > 0 {
+		maxSegment = 1200
+		log.Printf("⚙️  限制 FakeTCP 分段大小: %dB (FEC 模式自动开启，可通过 faketcp_max_segment 覆盖)", maxSegment)
+	} else if maxSegment > 0 {
+		log.Printf("⚙️  限制 FakeTCP 分段大小: %dB", maxSegment)
+	}
+	if pacingUs <= 0 && cfg.FECDataShards > 0 && cfg.FECParityShards > 0 {
+		pacingUs = 200
+		log.Printf("⚙️  启用 FakeTCP 发送节流: %dµs (FEC 模式自动开启，可通过 faketcp_pacing_us 覆盖)", pacingUs)
+	} else if pacingUs > 0 {
+		log.Printf("⚙️  启用 FakeTCP 发送节流: %dµs", pacingUs)
+	}
+	if pacingUs > 0 || maxSegment > 0 {
+		faketcp.SetTuning(faketcp.Tuning{
+			WritePacingMinDelay: time.Duration(pacingUs) * time.Microsecond,
+			MaxSegmentSize:      maxSegment,
+		})
+	}
+
 	log.Printf("✅ 使用 Raw Socket 模式 (真正的TCP伪装，类似udp2raw)")
 	log.Printf("✅ 性能优化：低延迟，高吞吐量")
 
@@ -594,7 +616,10 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 
 	// Additional MTU adjustment for cross-packet FEC: ensure each shard fits within raw TCP segments
 	if cfg.Transport == "rawtcp" && cfg.FECDataShards > 0 && cfg.FECParityShards > 0 {
-		const maxRawTCPSegment = 1400
+		maxRawTCPSegment := maxSegment
+		if maxRawTCPSegment <= 0 {
+			maxRawTCPSegment = 1400
+		}
 		const fecHeaderOverhead = 1 + 4 + 2 + 2 + 2 + 2 // PacketType + sessionID + shardIndex + dataShards + parityShards + shardSize
 		const packetTypeOverhead = 1
 		const lengthPrefixOverhead = 2
@@ -4290,7 +4315,10 @@ func (t *Tunnel) processFECShard(peerAddr string, fecPacket []byte) (uint32, [][
 		return 0, nil, fmt.Errorf("FEC shard size invalid: %d", shardSize)
 	}
 	// Ensure shard size fits within raw TCP segment to avoid re-segmentation
-	const maxRawTCPSegment = 1400
+	maxRawTCPSegment := faketcp.GetTuning().MaxSegmentSize
+	if maxRawTCPSegment <= 0 {
+		maxRawTCPSegment = 1400
+	}
 	const fecHeaderOverhead = 1 + 4 + 2 + 2 + 2 + 2
 	maxShardPayload := maxRawTCPSegment - fecHeaderOverhead
 	if shardSize > maxShardPayload {

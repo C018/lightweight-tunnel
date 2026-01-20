@@ -49,6 +49,10 @@ type Config struct {
 	// Control packets (keepalive, peer info, etc.) remain encrypted for security
 	// This reduces CPU overhead but assumes trusted network or relies on IP binding after authentication
 	EncryptAfterAuth bool `json:"encrypt_after_auth"` // Skip per-packet data encryption after authentication (default false)
+
+	// Fake TCP pacing configuration
+	FakeTCPWritePacingUs int `json:"faketcp_pacing_us"` // Minimum delay between fake TCP segments (microseconds, 0=auto/off)
+	FakeTCPMaxSegment    int `json:"faketcp_max_segment"` // Max payload bytes per fake TCP segment (0=auto)
 }
 
 // DefaultConfig returns a default configuration
@@ -84,6 +88,8 @@ func DefaultConfig() *Config {
 		RouteAdvertInterval:  300, // 5 minutes
 		P2PKeepAliveInterval: 25,  // 25 seconds
 		EncryptAfterAuth:     false, // Default to per-packet encryption for security
+		FakeTCPWritePacingUs: 0,
+		FakeTCPMaxSegment:    0,
 	}
 }
 
