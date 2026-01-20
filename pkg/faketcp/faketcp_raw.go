@@ -324,16 +324,55 @@ func (c *ConnRaw) recvLoop() {
 
 // WritePacket sends data with fake TCP header (API compatibility)
 func (c *ConnRaw) WritePacket(data []byte) error {
+	return c.writePacketInternal(data, true)
+}
+
+// WriteBatch sends multiple packets with a single lock acquisition to reduce contention
+func (c *ConnRaw) WriteBatch(packets [][]byte) error {
 	if atomic.LoadInt32(&c.closed) != 0 {
 		return fmt.Errorf("connection closed")
 	}
-
-	// Segment data into smaller chunks if needed
+	
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	
+	// Max segment size
 	maxSegment := tunables.MaxSegmentSize
 	if maxSegment <= 0 {
 		maxSegment = 1400
 	}
 
+	for _, data := range packets {
+		// Internal write logic without locking (already locked)
+		if err := c.writePacketInternalLocked(data, maxSegment); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// writePacketInternal handles the single-packet send logic.
+// If lock is true, it acquires the lock. If false, caller must hold lock.
+func (c *ConnRaw) writePacketInternal(data []byte, lock bool) error {
+	if atomic.LoadInt32(&c.closed) != 0 {
+		return fmt.Errorf("connection closed")
+	}
+
+	maxSegment := tunables.MaxSegmentSize
+	if maxSegment <= 0 {
+		maxSegment = 1400
+	}
+
+	if lock {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+	}
+
+	return c.writePacketInternalLocked(data, maxSegment)
+}
+
+// writePacketInternalLocked contains the core sending logic assuming lock is held
+func (c *ConnRaw) writePacketInternalLocked(data []byte, maxSegment int) error {
 	// Log warning if data will be segmented (indicates potential encryption issue)
 	if len(data) > maxSegment {
 		log.Printf("⚠️  WARNING: Packet size %d exceeds maxSegment %d, will be segmented into %d parts. "+
@@ -342,9 +381,6 @@ func (c *ConnRaw) WritePacket(data []byte) error {
 			"Check if MTU was manually set too high or if auto-adjustment was bypassed.",
 			len(data), maxSegment, (len(data)+maxSegment-1)/maxSegment, maxSegment-29) // 29 = 1 packet type + 28 encryption overhead
 	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	segmentCount := (len(data) + maxSegment - 1) / maxSegment
 	for offset := 0; offset < len(data); offset += maxSegment {
@@ -376,6 +412,7 @@ func (c *ConnRaw) WritePacket(data []byte) error {
 
 	return nil
 }
+
 
 // ReadPacket receives data (API compatibility)
 func (c *ConnRaw) ReadPacket() ([]byte, error) {

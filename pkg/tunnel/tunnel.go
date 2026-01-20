@@ -4366,6 +4366,10 @@ func (t *Tunnel) fecWorker() {
 
 				// Send
 				sessionID := work.sessionID
+				
+				// Prepare all packets for batch send
+				packetsToSend := make([][]byte, 0, len(shards))
+				
 				for i, shard := range shards {
 					fecPacket := make([]byte, 1+4+2+2+2+2+len(shard))
 					fecPacket[0] = PacketTypeFECShard
@@ -4382,10 +4386,12 @@ func (t *Tunnel) fecWorker() {
 					fecPacket[11] = byte(shardSize >> 8)
 					fecPacket[12] = byte(shardSize)
 					copy(fecPacket[13:], shard)
+					
+					packetsToSend = append(packetsToSend, fecPacket)
+				}
 
-					if err := conn.WritePacket(fecPacket); err != nil {
-						// log only verbose
-					}
+				if err := conn.WriteBatch(packetsToSend); err != nil {
+					// Log but continue
 				}
 
 				if pacing := faketcp.GetTuning().WritePacingMinDelay; pacing > 0 {

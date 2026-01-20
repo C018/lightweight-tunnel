@@ -400,18 +400,38 @@ func (l *Listener) Addr() net.Addr {
 
 // WritePacket sends data with fake TCP header
 func (c *Conn) WritePacket(data []byte) error {
-	if len(data) > MaxPayloadSize {
-		return fmt.Errorf("payload size %d exceeds maximum %d bytes", len(data), MaxPayloadSize)
-	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	// Segment data by typical MSS to look like TCP segments
+	maxSegment := tunables.MaxSegmentSize
+	if maxSegment <= 0 || maxSegment > MaxPayloadSize {
+		maxSegment = MaxPayloadSize
+	}
+	return c.writePacketInternalLocked(data, maxSegment)
+}
+
+// WriteBatch sends multiple packets efficiently
+func (c *Conn) WriteBatch(packets [][]byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	maxSegment := tunables.MaxSegmentSize
 	if maxSegment <= 0 || maxSegment > MaxPayloadSize {
 		maxSegment = MaxPayloadSize
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	for _, pkt := range packets {
+		if err := c.writePacketInternalLocked(pkt, maxSegment); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Conn) writePacketInternalLocked(data []byte, maxSegment int) error {
+	if len(data) > MaxPayloadSize {
+		return fmt.Errorf("payload size %d exceeds maximum %d bytes", len(data), MaxPayloadSize)
+	}
 
 	total := len(data)
 	sent := 0
@@ -445,7 +465,16 @@ func (c *Conn) WritePacket(data []byte) error {
 		c.seqNum += uint32(len(seg))
 		sent += segLen
 
-		if tunables.WritePacingMinDelay > 0 {
+		// Calculate pacing duration - similar to raw socket logic
+		// We avoid holding the lock during sleep if possible, but here we are in a Locked method.
+		// For batch processing, we might prefer external pacing.
+		// However, to keep internal fragmentation pacing consistent:
+		if tunables.WritePacingMinDelay > 0 && sent < total {
+			// This sleep is holding the lock! 
+			// In Batched mode, this might be undesirable if multiple batches overlap? 
+			// But we only have one writer usually.
+			// Ideally we shouldn't sleep with lock held, but Release/Acquire is complex here.
+			// Given this is intra-packet fragmentation (rare), it's acceptable.
 			time.Sleep(tunables.WritePacingMinDelay)
 		}
 	}

@@ -56,6 +56,7 @@ func ListenAuto(addr string) (interface{}, error) {
 // ConnAdapter is a unified interface for both UDP and Raw socket connections
 type ConnAdapter interface {
 	WritePacket(data []byte) error
+	WriteBatch(packets [][]byte) error // Optimized batch write
 	ReadPacket() ([]byte, error)
 	Close() error
 	LocalAddr() net.Addr
