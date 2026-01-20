@@ -43,13 +43,15 @@ const (
 // Tuning controls runtime knobs for faketcp behavior.
 type Tuning struct {
 	ListenerQueueSize   int           // pending accept queue length
+	RecvQueueSize       int           // payload receive queue per connection
 	HandshakeMaxErrors  int           // max non-timeout handshake read errors before giving up
 	WritePacingMinDelay time.Duration // optional pacing delay between segments to reduce burst loss
 	MaxSegmentSize      int           // max payload bytes per fake TCP segment
 }
 
 var tunables = Tuning{
-	ListenerQueueSize:   8,
+	ListenerQueueSize:   128,  // Increased default (was 8)
+	RecvQueueSize:       4096, // Increased default (was 100)
 	HandshakeMaxErrors:  2,
 	WritePacingMinDelay: 0,
 	MaxSegmentSize:      1400,
@@ -59,6 +61,9 @@ var tunables = Tuning{
 func SetTuning(t Tuning) {
 	if t.ListenerQueueSize > 0 {
 		tunables.ListenerQueueSize = t.ListenerQueueSize
+	}
+	if t.RecvQueueSize > 0 {
+		tunables.RecvQueueSize = t.RecvQueueSize
 	}
 	if t.HandshakeMaxErrors > 0 {
 		tunables.HandshakeMaxErrors = t.HandshakeMaxErrors
@@ -159,11 +164,19 @@ func NewConn(udpConn *net.UDPConn, remoteAddr *net.UDPAddr, isConnected bool) (*
 func (l *Listener) dispatch() {
 	buf := make([]byte, MaxPacketSize)
 
+	// Simple 1-item cache to reduce map lookups and allocations for the active stream
+	var lastConn *Conn
+	var lastPort int
+	var lastIP net.IP
+	var lastKey string
+
 	for {
-		l.udpConn.SetReadDeadline(time.Now().Add(ReadTimeoutDuration))
 		n, remoteAddr, err := l.udpConn.ReadFromUDP(buf)
 		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			// If closed, return immediately
+			if opErr, ok := err.(*net.OpError); ok && !opErr.Temporary() {
+				// Connection closed
+			} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
 			}
 			l.closeOnce.Do(func() {
@@ -181,11 +194,35 @@ func (l *Listener) dispatch() {
 			continue
 		}
 
-		connKey := remoteAddr.String()
+		var conn *Conn
+		var exists bool
+		var connKey string
 
-		l.mu.RLock()
-		conn, exists := l.connMap[connKey]
-		l.mu.RUnlock()
+		// Fast path: check cache
+		if lastConn != nil && remoteAddr.Port == lastPort && remoteAddr.IP.Equal(lastIP) {
+			conn = lastConn
+			connKey = lastKey
+			exists = true
+		} else {
+			// Slow path: full lookup
+			connKey = remoteAddr.String()
+
+			l.mu.RLock()
+			conn, exists = l.connMap[connKey]
+			l.mu.RUnlock()
+
+			if exists {
+				// Update cache
+				lastConn = conn
+				lastPort = remoteAddr.Port
+				lastIP = remoteAddr.IP
+				lastKey = connKey
+			} else {
+				// Invalidate cache if we're dealing with a new/unknown peer to prevent stale matches
+				// (Though strict IP/Port check prevents false positives, this keeps cache clean)
+				lastConn = nil
+			}
+		}
 
 		// Drop stale closed connection entries so new traffic can recreate connections
 		if exists && atomic.LoadInt32(&conn.closed) != 0 {
@@ -194,6 +231,7 @@ func (l *Listener) dispatch() {
 			l.mu.Unlock()
 			conn = nil
 			exists = false
+			lastConn = nil // Clear cache
 		}
 
 		if !exists {
@@ -238,7 +276,7 @@ func (l *Listener) createConnection(remoteAddr *net.UDPAddr, tcpHeader *TCPHeade
 		seqNum:      serverIsn,
 		ackNum:      tcpHeader.SeqNum + 1,
 		isConnected: false,
-		recvQueue:   make(chan []byte, 100),
+		recvQueue:   make(chan []byte, tunables.RecvQueueSize),
 	}
 
 	// Respond with SYN-ACK when possible to improve handshake success
@@ -532,10 +570,13 @@ func (c *Conn) ReadPacket() ([]byte, error) {
 		}
 	}
 
-	// Connected socket - read directly with deadline to allow interruption
-	c.udpConn.SetReadDeadline(time.Now().Add(ReadTimeoutDuration))
+	// Connected socket - read directly (blocking); checks close on error
+	// c.udpConn.SetReadDeadline(time.Now().Add(ReadTimeoutDuration))
 
-	buf := make([]byte, MaxPacketSize)
+	bufPtr := readBufPool.Get().([]byte)
+	defer readBufPool.Put(bufPtr)
+	buf := bufPtr
+
 	n, err := c.udpConn.Read(buf)
 	if err != nil {
 		// Check if it's a timeout - return a specific error to allow caller to retry
@@ -575,6 +616,16 @@ func (c *Conn) ReadPacket() ([]byte, error) {
 
 	return payload, nil
 }
+
+
+// Shared buffer pool to reduce GC pressure
+var readBufPool = sync.Pool{
+	New: func() interface{} {
+		// Allocate slightly more to be safe, though MaxPacketSize (65535 or similar) is standard limit
+		return make([]byte, MaxPacketSize) 
+	},
+}
+
 
 // buildTCPHeader constructs a fake TCP header
 func (c *Conn) buildTCPHeader(dataLen int) *TCPHeader {
