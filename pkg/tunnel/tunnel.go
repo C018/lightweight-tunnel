@@ -1462,6 +1462,13 @@ func (t *Tunnel) startServer() error {
 	// Start accepting clients in a goroutine
 	t.wg.Add(1)
 	go t.acceptClients(listener)
+	
+	// Server Mode: Start FEC Ingress processing workers
+	// These handle high-speed FEC reconstruction for ALL clients
+	for i := 0; i < t.config.SendWorkers; i++ {
+		t.wg.Add(1)
+		go t.fecIngressWorker()
+	}
 
 	if t.config.MultiClient {
 		log.Printf("Multi-client mode enabled (max: %d clients)", t.config.MaxClients)
