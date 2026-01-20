@@ -4353,7 +4353,8 @@ func (t *Tunnel) fecWorker() {
 				if len(encPackets) < dataShards {
 					paddingNeeded := dataShards - len(encPackets)
 					for i := 0; i < paddingNeeded; i++ {
-						encPackets = append(encPackets, make([]byte, 1))
+						// Use empty padding packets that will be filtered out by receiver
+						encPackets = append(encPackets, []byte{})
 					}
 				}
 
@@ -4675,7 +4676,9 @@ func (t *Tunnel) processFECShard(peerAddr string, fecPacket []byte) (uint32, [][
 				continue
 			}
 			pktLen := int(binary.BigEndian.Uint16(shard[0:2]))
-			if pktLen <= 0 || pktLen > len(shard)-2 {
+			// Filter out empty/dummy padding packets and obviously too-small packets
+			// Minimum encrypted packet has nonce+tag (approx 28 bytes) + header
+			if pktLen <= 1 || pktLen > len(shard)-2 {
 				continue
 			}
 			data := make([]byte, pktLen)
