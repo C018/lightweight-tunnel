@@ -200,8 +200,13 @@ type clientInfo struct {
 
 func (c *ClientConnection) setCipherWithGen(cipher *crypto.Cipher, gen uint64) {
 	c.mu.Lock()
-	c.cipher = cipher
-	c.cipherGen = gen
+	// Only update if the new generation is greater or equal to the current one
+	// This prevents race conditions where a worker processing an old FEC packet
+	// accidentally rolls back the cipher key to an old version.
+	if gen >= c.cipherGen {
+		c.cipher = cipher
+		c.cipherGen = gen
+	}
 	c.mu.Unlock()
 }
 
@@ -486,9 +491,10 @@ func (t *Tunnel) handleRecoveredBatch(peerAddr string, sessionID uint32, packets
 		atomic.AddUint64(&t.statFECLateBatchDrop, 1)
 		t.fecReorderMux.Unlock()
 		for _, pkt := range packets {
-			if isUDPPacket(pkt) {
-				deliver(pkt)
-			}
+			// Even if late, deliver it. The upper layer application (or kernel TCP stack)
+			// handles reordering better than we can guess.
+			// Especially because isUDPPacket() cannot inspect encrypted payloads accurately.
+			deliver(pkt)
 		}
 		return
 	}
