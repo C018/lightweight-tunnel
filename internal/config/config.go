@@ -65,7 +65,7 @@ func DefaultConfig() *Config {
 		TunnelAddr:          "10.0.0.1/24",
 		MTU:                 1400,
 		FECDataShards:       10,
-		FECParityShards:     3,
+		FECParityShards:     2,
 		Timeout:             30,
 		KeepaliveInterval:   5, // Reduced from 10 to 5 seconds for faster detection of connection issues
 		SendQueueSize:       10000, // Increased to 10000 to prevent queue full errors during high bandwidth testing

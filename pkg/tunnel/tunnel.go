@@ -2079,7 +2079,7 @@ func (t *Tunnel) netWriter() {
 	}
 
 	// FEC enabled: batch packets within a short window for cross-packet recovery
-	const fecBatchTimeout = 5 * time.Millisecond
+	const fecBatchTimeout = 2 * time.Millisecond
 	dataShards := t.config.FECDataShards
 	batch := make([][]byte, 0, dataShards)
 	flushTimer := time.NewTimer(fecBatchTimeout)
@@ -2159,12 +2159,11 @@ func (t *Tunnel) netWriter() {
 			if len(batch) == 1 {
 				resetTimer()
 			}
-			// Smart batching: small batches (<=3) flush immediately to reduce latency
-			// Large batches wait for full dataShards or timeout
+			// Smart batching: flush at 6 packets to balance latency and FEC efficiency
 			if len(batch) >= dataShards {
 				flushBatch(t.config.FECParityShards)
-			} else if len(batch) >= 3 && len(batch) < dataShards {
-				// Flush small batch with minimal FEC to avoid delay accumulation
+			} else if len(batch) >= 6 {
+				// Flush medium batch with reduced FEC overhead
 				flushBatch(1)
 			}
 		case <-flushTimer.C:
@@ -2491,7 +2490,7 @@ func (t *Tunnel) clientNetWriter(client *ClientConnection) {
 	}
 
 	// FEC enabled: batch packets within a short window for cross-packet recovery
-	const fecBatchTimeout = 5 * time.Millisecond
+	const fecBatchTimeout = 2 * time.Millisecond
 	dataShards := t.config.FECDataShards
 	batch := make([][]byte, 0, dataShards)
 	flushTimer := time.NewTimer(fecBatchTimeout)
@@ -2552,10 +2551,10 @@ func (t *Tunnel) clientNetWriter(client *ClientConnection) {
 			if len(batch) == 1 {
 				resetTimer()
 			}
-			// Smart batching: small batches (<=3) flush immediately
+			// Smart batching: flush at 6 packets to balance latency and FEC efficiency
 			if len(batch) >= dataShards {
 				flushBatch(t.config.FECParityShards)
-			} else if len(batch) >= 3 && len(batch) < dataShards {
+			} else if len(batch) >= 6 {
 				flushBatch(1)
 			}
 		case <-flushTimer.C:
