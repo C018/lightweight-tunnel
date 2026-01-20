@@ -295,6 +295,19 @@ func Dial(remoteAddr string, timeout time.Duration) (*Conn, error) {
 		return nil, fmt.Errorf("failed to dial UDP: %v", err)
 	}
 
+	// Determine buffer size
+	// 4MB is the target optimized size for high throughput
+	const bufferSize = 4 * 1024 * 1024
+	
+	// Set Receive Buffer
+	if err := udpConn.SetReadBuffer(bufferSize); err != nil {
+		log.Printf("⚠️  Failed to set UDP read buffer to %d: %v", bufferSize, err)
+	}
+	// Set Send Buffer
+	if err := udpConn.SetWriteBuffer(bufferSize); err != nil {
+		log.Printf("⚠️  Failed to set UDP write buffer to %d: %v", bufferSize, err)
+	}
+
 	conn, err := NewConn(udpConn, raddr, true)
 	if err != nil {
 		udpConn.Close()
@@ -366,6 +379,24 @@ func Listen(addr string) (*Listener, error) {
 	udpConn, err := net.ListenUDP("udp", laddr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to listen UDP: %v", err)
+	}
+
+	// Determine buffer size
+	// 4MB is the target optimized size for high throughput
+	const bufferSize = 4 * 1024 * 1024
+	
+	// Set Receive Buffer
+	if err := udpConn.SetReadBuffer(bufferSize); err != nil {
+		log.Printf("⚠️  Failed to set UDP read buffer to %d: %v", bufferSize, err)
+	} else {
+		log.Printf("✅ UDP Read Buffer set to %d bytes", bufferSize)
+	}
+
+	// Set Send Buffer
+	if err := udpConn.SetWriteBuffer(bufferSize); err != nil {
+		log.Printf("⚠️  Failed to set UDP write buffer to %d: %v", bufferSize, err)
+	} else {
+		log.Printf("✅ UDP Write Buffer set to %d bytes", bufferSize)
 	}
 
 	l := &Listener{
