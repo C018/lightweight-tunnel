@@ -170,6 +170,7 @@ type fecRecvSession struct {
 	lastUpdate    time.Time // Last time a shard was received
 	originalSize  int      // Original packet size before FEC encoding
 	expectedShardSize int  // Expected shard size for this session
+	mu            sync.Mutex // Protects session state
 }
 
 type fecReorderBuffer struct {
@@ -4606,15 +4607,19 @@ func (t *Tunnel) processFECShard(peerAddr string, fecPacket []byte) (uint32, [][
 		}
 		t.fecRecvSessions[sessionKey] = session
 	}
+	t.fecRecvMux.Unlock()
+
+	// LOCK SESSION TO PREVENT RACE CONDITIONS DURING SHARD INSERTION/CHECK
+	session.mu.Lock()
+	defer session.mu.Unlock()
 
 	// Validate shard consistency
 	if session.dataShards != dataShards || session.parityShards != parityShards || session.expectedShardSize != shardSize {
-		delete(t.fecRecvSessions, sessionKey)
-		t.fecRecvMux.Unlock()
+		// Session corruption or collision logic... 
+		// We can't delete from map here safely without re-locking global mux?
+		// Just fail this shard.
 		return 0, nil, fmt.Errorf("FEC session %s: shard metadata mismatch", sessionKey)
 	}
-
-	t.fecRecvMux.Unlock()
 
 	// Add shard to session
 	if !session.shardPresent[shardIndex] {
@@ -4647,11 +4652,9 @@ func (t *Tunnel) processFECShard(peerAddr string, fecPacket []byte) (uint32, [][
 
 		if err != nil {
 			if session.receivedCount >= session.totalShards {
-				// Unrecoverable only if we have ALL shards (or way too many but wrong ones?)
-				// Actually ReconstructShards failing means something is corrupted if count >= dataShards.
-				t.fecRecvMux.Lock()
-				delete(t.fecRecvSessions, sessionKey)
-				t.fecRecvMux.Unlock()
+				// Unrecoverable
+				// NOTE: We do not delete from map here to avoid lock complexity with global mux.
+				// The cleanupStaleFECSessions goroutine will handle it eventually.
 				atomic.AddUint64(&t.statFECSessionsUnrecoverable, 1)
 				return sessionID, nil, nil
 			}
@@ -4677,10 +4680,32 @@ func (t *Tunnel) processFECShard(peerAddr string, fecPacket []byte) (uint32, [][
 			packets = append(packets, data)
 			atomic.AddUint64(&t.statFECPacketsRecovered, 1)
 		}
+		
+		// Mark session as complete so we don't process it again?
+		// Actually best to remove it from map to save memory.
+		// But we need to unlock session.mu before locking global t.fecRecvMux to avoid deadlock risk if cleanup is running?
+		// Actually, standard practice: Map Lock -> ... -> delete.
+		// Here we hold session.mu.
+		
+		// To safely delete:
+		// 1. Release session lock
+		// 2. Acquire Map lock
+		// 3. Delete
+		// But defer session.mu.Unlock() will run at end.
+		
+		// Strategy: Just let the cleanup timer remove it OR handle it asynchronously?
+		// Optimized: If we successfully reconstructed, we can mark it "done" in session struct
+		// and let cleanup remove it? Or leave it to handle dupes?
+		// If we return packets, caller will process them. If we return them AGAIN for same session (duplicate batch),
+		// we get replay.
+		// So we SHOULD remove it.
 
-		t.fecRecvMux.Lock()
-		delete(t.fecRecvSessions, sessionKey)
-		t.fecRecvMux.Unlock()
+		// We will launch a goroutine to remove it to avoid lock inversion/complexity
+		go func(key string) {
+			t.fecRecvMux.Lock()
+			delete(t.fecRecvSessions, key)
+			t.fecRecvMux.Unlock()
+		}(sessionKey)
 
 		return sessionID, packets, nil
 	}
