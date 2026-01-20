@@ -911,12 +911,17 @@ func (t *Tunnel) Start() error {
 		if netReaderStarted {
 			// +1 main netWriter + 3 groups of workers (Send, FEC, Decrypt) + default ones
 			// TunWrites are now parallelized as well
-			t.wg.Add(3 + t.config.SendWorkers*2) 
+			t.wg.Add(3 + t.config.SendWorkers*3) 
 			go t.tunReader()
 			
 			// Parallelize TUN writes to overcome syscall bottleneck
 			for i := 0; i < t.config.SendWorkers; i++ {
 				go t.tunWriter()
+			}
+			
+			// Parallelize Decryption workers (Wait-free model)
+			for i := 0; i < t.config.SendWorkers; i++ {
+				go t.fecDecryptionWorker()
 			}
 
 			go t.netWriter() // Reverted to single netWriter (dispatcher)
@@ -927,12 +932,17 @@ func (t *Tunnel) Start() error {
 			}
 		} else {
 			// TunWrites + FEC workers
-			t.wg.Add(4 + t.config.SendWorkers*2)
+			t.wg.Add(4 + t.config.SendWorkers*3)
 			go t.tunReader()
 			
 			// Parallelize TUN writes to overcome syscall bottleneck
 			for i := 0; i < t.config.SendWorkers; i++ {
 				go t.tunWriter()
+			}
+
+			// Parallelize Decryption workers
+			for i := 0; i < t.config.SendWorkers; i++ {
+				go t.fecDecryptionWorker()
 			}
 
 			go t.netReader()
@@ -4409,6 +4419,7 @@ func (t *Tunnel) fecWorker() {
 }
 
 // fecDecryptionWorker processes batches of recovered packets with parallel decryption
+// Now runs in parallel without internal locking
 func (t *Tunnel) fecDecryptionWorker() {
 	defer t.wg.Done()
 
@@ -4421,29 +4432,12 @@ func (t *Tunnel) fecDecryptionWorker() {
 				continue
 			}
 
-			// Decrypt batch in parallel to utilize multi-core
-			var wg sync.WaitGroup
-			decryptedBatch := make([][]byte, len(batch))
-			
-			// Use a semaphore to limit max concurrency per batch if needed, 
-			// but for 10-20 packets, spawning goroutines is fine.
-			wg.Add(len(batch))
-			
-			for i, pkt := range batch {
-				go func(idx int, data []byte) {
-					defer wg.Done()
-					dec, err := t.decryptPacket(data)
-					if err == nil {
-						decryptedBatch[idx] = dec
-					} else {
-						// Quietly ignore decryption errors (corrupt shards, etc)
-					}
-				}(i, pkt)
-			}
-			wg.Wait()
-			
-			// Enqueue in strict order
-			for _, dec := range decryptedBatch {
+			// Sequential processing within a worker, but parallel workers serve the queue
+			for _, pkt := range batch {
+				dec, err := t.decryptPacket(pkt)
+				if err != nil {
+					continue
+				}
 				if len(dec) < 1 {
 					continue
 				}

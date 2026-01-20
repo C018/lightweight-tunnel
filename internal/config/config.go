@@ -71,8 +71,8 @@ func DefaultConfig() *Config {
 		FECParityShards:      2,
 		Timeout:              30,
 		KeepaliveInterval:    5,    // Reduced from 10 to 5 seconds for faster detection of connection issues
-		SendQueueSize:        1000, // Balanced for latency and throughput (reduced from 10000 to avoid bufferbloat)
-		RecvQueueSize:        1000, // Balanced for latency and throughput (reduced from 10000 to avoid bufferbloat)
+		RecvQueueSize:        4096, // Increased to absorb bursts
+		SendQueueSize:        4096, // Increased to absorb bursts
 		TunName:              "",
 		Routes:               []string{},
 		ConfigPushInterval:   0,
