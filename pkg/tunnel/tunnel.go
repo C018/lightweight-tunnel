@@ -778,6 +778,7 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 		fecReorderBufs:     make(map[string]*fecReorderBuffer),
 		fecWorkQueue:       make(chan *fecBatchWork, cfg.SendQueueSize), // Reuse send queue size for work queue
 		fecDecryptionQueue: make(chan [][]byte, cfg.SendQueueSize*2),    // Queue for parallel decryption
+		fecIngressQueue:    make(chan *fecIngressWork, cfg.RecvQueueSize*2), // Critical fix: Initialize ingress queue
 	}
 	t.packetPool = &sync.Pool{
 		New: func() any {
