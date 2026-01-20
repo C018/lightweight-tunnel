@@ -4335,7 +4335,8 @@ func (t *Tunnel) fecWorker() {
 				// FEC Encoding
 				dataShards := t.config.FECDataShards
 				if len(encPackets) < dataShards {
-					for i := 0; i < dataShards-len(encPackets); i++ {
+					paddingNeeded := dataShards - len(encPackets)
+					for i := 0; i < paddingNeeded; i++ {
 						encPackets = append(encPackets, make([]byte, 1))
 					}
 				}
