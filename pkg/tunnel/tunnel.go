@@ -499,14 +499,21 @@ func (t *Tunnel) handleRecoveredBatch(peerAddr string, sessionID uint32, packets
 
 	// Deliver all pending packets within window (allow gaps)
 	var toDeliver [][]byte
+	var maxDelivered uint32
+	hasDelivered := false
 	for sid := buf.next; sid < windowEnd; sid++ {
 		if pkts, ok := buf.pending[sid]; ok {
 			toDeliver = append(toDeliver, pkts...)
 			delete(buf.pending, sid)
-			if sid == buf.next {
-				buf.next++
+			if !hasDelivered || sid > maxDelivered {
+				maxDelivered = sid
+				hasDelivered = true
 			}
 		}
+	}
+	// Advance next to after the maximum delivered session
+	if hasDelivered && maxDelivered >= buf.next {
+		buf.next = maxDelivered + 1
 	}
 
 	// Timeout-based cleanup: advance next pointer if gap persists too long
@@ -2072,7 +2079,7 @@ func (t *Tunnel) netWriter() {
 	}
 
 	// FEC enabled: batch packets within a short window for cross-packet recovery
-	const fecBatchTimeout = 50 * time.Millisecond
+	const fecBatchTimeout = 20 * time.Millisecond
 	dataShards := t.config.FECDataShards
 	batch := make([][]byte, 0, dataShards)
 	flushTimer := time.NewTimer(fecBatchTimeout)
@@ -2479,7 +2486,7 @@ func (t *Tunnel) clientNetWriter(client *ClientConnection) {
 	}
 
 	// FEC enabled: batch packets within a short window for cross-packet recovery
-	const fecBatchTimeout = 50 * time.Millisecond
+	const fecBatchTimeout = 20 * time.Millisecond
 	dataShards := t.config.FECDataShards
 	batch := make([][]byte, 0, dataShards)
 	flushTimer := time.NewTimer(fecBatchTimeout)
