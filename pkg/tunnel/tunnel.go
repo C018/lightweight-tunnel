@@ -293,6 +293,9 @@ type Tunnel struct {
 
 	// Work queue for parallel FEC processing
 	fecWorkQueue chan *fecBatchWork
+	
+	// Work queue for parallel Decryption (Receive side)
+	fecDecryptionQueue chan [][]byte
 }
 
 // fecBatchWork represents a batch of packets to be processed by workers
@@ -757,6 +760,7 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 		fecSessionID:       uint32(time.Now().UnixNano()),
 		fecReorderBufs:     make(map[string]*fecReorderBuffer),
 		fecWorkQueue:       make(chan *fecBatchWork, cfg.SendQueueSize), // Reuse send queue size for work queue
+		fecDecryptionQueue: make(chan [][]byte, cfg.SendQueueSize*2),    // Queue for parallel decryption
 	}
 	t.packetPool = &sync.Pool{
 		New: func() any {
@@ -859,6 +863,10 @@ func (t *Tunnel) Start() error {
 	}
 	// Start stats logger
 	t.logStatsLoop()
+
+	// Start decryption worker
+	t.wg.Add(1)
+	go t.fecDecryptionWorker()
 
 	// Establish connection based on mode
 	if t.config.Mode == "client" {
@@ -1900,36 +1908,22 @@ func (t *Tunnel) netReader() {
 					continue
 				}
 
+				var batch [][]byte
 				t.handleRecoveredBatch(t.config.RemoteAddr, sessionID, reconstructedPackets, func(reconstructedPacket []byte) {
-					decryptedPacket, err := t.decryptPacket(reconstructedPacket)
-					if err != nil {
-						log.Printf("FEC reconstructed packet decryption error: %v", err)
-						return
-					}
-
-					if len(decryptedPacket) < 1 {
-						return
-					}
-
-					packetType := decryptedPacket[0]
-					payload := decryptedPacket[1:]
-
-					if packetType == PacketTypeData {
-						// CRITICAL FIX: Never block on receive queue to prevent infinite backlog
-						// ROOT CAUSE: When block=true (t.fecEnabled), packets wait indefinitely for queue space
-						// This caused UDP test to take 30s instead of 10s - packets kept accumulating
-						if !enqueueWithPolicy(t.recvQueue, payload, t.stopCh, false) {
-							atomic.AddUint64(&t.statQueueDropRecv, 1)
-							select {
-							case <-t.stopCh:
-								return
-							default:
-								log.Printf("Receive queue full after timeout, dropping FEC reconstructed packet")
-							}
-						}
-					}
+					batch = append(batch, reconstructedPacket)
 				})
+
+				if len(batch) > 0 {
+					select {
+					case t.fecDecryptionQueue <- batch:
+					default:
+						// Avoid blocking netReader if workers are slow
+						atomic.AddUint64(&t.statQueueDropRecv, uint64(len(batch)))
+					}
+				}
 			}
+			continue
+		}
 			continue
 		}
 
@@ -3515,9 +3509,9 @@ func (t *Tunnel) decryptWithFallback(data []byte) ([]byte, *crypto.Cipher, uint6
 	if t.config.EncryptAfterAuth && len(data) > 0 {
 		packetType := data[0]
 		if packetType == PacketTypeData {
-			t.authMux.Lock()
+			t.authMux.RLock()
 			isAuthenticated := t.authenticated
-			t.authMux.Unlock()
+			t.authMux.RUnlock()
 			
 			if isAuthenticated {
 				// Data packets in authenticated sessions are not encrypted
@@ -4402,6 +4396,57 @@ func (t *Tunnel) fecWorker() {
 	}
 }
 
+// fecDecryptionWorker processes batches of recovered packets with parallel decryption
+func (t *Tunnel) fecDecryptionWorker() {
+	defer t.wg.Done()
+
+	for {
+		select {
+		case <-t.stopCh:
+			return
+		case batch := <-t.fecDecryptionQueue:
+			if len(batch) == 0 {
+				continue
+			}
+
+			// Decrypt batch in parallel to utilize multi-core
+			var wg sync.WaitGroup
+			decryptedBatch := make([][]byte, len(batch))
+			
+			// Use a semaphore to limit max concurrency per batch if needed, 
+			// but for 10-20 packets, spawning goroutines is fine.
+			wg.Add(len(batch))
+			
+			for i, pkt := range batch {
+				go func(idx int, data []byte) {
+					defer wg.Done()
+					dec, err := t.decryptPacket(data)
+					if err == nil {
+						decryptedBatch[idx] = dec
+					} else {
+						// Quietly ignore decryption errors (corrupt shards, etc)
+					}
+				}(i, pkt)
+			}
+			wg.Wait()
+			
+			// Enqueue in strict order
+			for _, dec := range decryptedBatch {
+				if len(dec) < 1 {
+					continue
+				}
+				if dec[0] == PacketTypeData {
+					// Use non-blocking enqueue for high-speed reception
+					if !enqueueWithPolicy(t.recvQueue, dec[1:], t.stopCh, false) {
+						atomic.AddUint64(&t.statQueueDropRecv, 1)
+					}
+				}
+			}
+		}
+	}
+}
+
+// sendBatchWithFEC sends packets using FEC encoding
 func (t *Tunnel) sendBatchWithFEC(conn faketcp.ConnAdapter, packets [][]byte, parityShards int, encryptFn func([]byte) ([]byte, error)) error {
 	if !t.fecEnabled || t.fec == nil {
 		return errors.New("FEC not enabled")
