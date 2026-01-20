@@ -275,6 +275,8 @@ type Tunnel struct {
 	statFECSessionsRecovered uint64
 	statFECSessionsUnrecoverable uint64
 	statFECPacketsRecovered uint64
+	statFECLateBatchDrop    uint64
+	statFECGapSkip          uint64
 	statQueueDropSend       uint64
 	statQueueDropRecv       uint64
 	statQueueDropClientSend uint64
@@ -403,11 +405,13 @@ func (t *Tunnel) logStatsLoop() {
 			case <-t.stopCh:
 				return
 			case <-ticker.C:
-				log.Printf("Stats: fec_shards=%d fec_recovered_sessions=%d fec_unrecoverable=%d fec_packets_recovered=%d drops_send=%d drops_recv=%d drops_client_send=%d drops_route=%d drops_forward=%d oversized_drop=%d fragments=%d",
+				log.Printf("Stats: fec_shards=%d fec_recovered_sessions=%d fec_unrecoverable=%d fec_packets_recovered=%d fec_late_drop=%d fec_gap_skip=%d drops_send=%d drops_recv=%d drops_client_send=%d drops_route=%d drops_forward=%d oversized_drop=%d fragments=%d",
 					atomic.LoadUint64(&t.statFECShardsRecv),
 					atomic.LoadUint64(&t.statFECSessionsRecovered),
 					atomic.LoadUint64(&t.statFECSessionsUnrecoverable),
 					atomic.LoadUint64(&t.statFECPacketsRecovered),
+					atomic.LoadUint64(&t.statFECLateBatchDrop),
+					atomic.LoadUint64(&t.statFECGapSkip),
 					atomic.LoadUint64(&t.statQueueDropSend),
 					atomic.LoadUint64(&t.statQueueDropRecv),
 					atomic.LoadUint64(&t.statQueueDropClientSend),
@@ -425,7 +429,7 @@ func (t *Tunnel) handleRecoveredBatch(peerAddr string, sessionID uint32, packets
 	if len(packets) == 0 {
 		return
 	}
-	const reorderTimeout = 30 * time.Millisecond
+	const reorderTimeout = 200 * time.Millisecond
 
 	t.fecReorderMux.Lock()
 	buf := t.fecReorderBufs[peerAddr]
@@ -438,11 +442,9 @@ func (t *Tunnel) handleRecoveredBatch(peerAddr string, sessionID uint32, packets
 		t.fecReorderBufs[peerAddr] = buf
 	}
 	if sessionID < buf.next {
-		// Late batch; deliver immediately to avoid loss
+		// Late batch; drop to preserve ordering
+		atomic.AddUint64(&t.statFECLateBatchDrop, 1)
 		t.fecReorderMux.Unlock()
-		for _, pkt := range packets {
-			deliver(pkt)
-		}
 		return
 	}
 
@@ -467,7 +469,7 @@ func (t *Tunnel) handleRecoveredBatch(peerAddr string, sessionID uint32, packets
 			buf.gapSince = time.Now()
 		}
 		if time.Since(buf.gapSince) > reorderTimeout {
-			// Resync to the smallest available session ID
+			// Skip missing sessions and resync to the smallest available session ID
 			var min uint32
 			first := true
 			for sid := range buf.pending {
@@ -475,6 +477,9 @@ func (t *Tunnel) handleRecoveredBatch(peerAddr string, sessionID uint32, packets
 					min = sid
 					first = false
 				}
+			}
+			if !first && min > buf.next {
+				atomic.AddUint64(&t.statFECGapSkip, uint64(min-buf.next))
 			}
 			buf.next = min
 			buf.gapSince = time.Time{}
