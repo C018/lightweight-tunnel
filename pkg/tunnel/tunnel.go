@@ -171,6 +171,12 @@ type fecRecvSession struct {
 	expectedShardSize int  // Expected shard size for this session
 }
 
+type fecReorderBuffer struct {
+	next       uint32
+	pending    map[uint32][][]byte
+	lastUpdate time.Time
+}
+
 // ConfigUpdateMessage carries server-pushed configuration updates.
 type ConfigUpdateMessage struct {
 	Key    string   `json:"key"`
@@ -260,6 +266,8 @@ type Tunnel struct {
 	fecRecvSessions  map[string]*fecRecvSession  // FEC receive sessions (key: "peerAddr:sessionID" -> session)
 	fecRecvMux       sync.Mutex                  // Protects fecRecvSessions
 	fecCleanupTicker *time.Ticker                // Ticker for cleaning up stale FEC sessions
+	fecReorderMux    sync.Mutex
+	fecReorderBufs   map[string]*fecReorderBuffer
 
 	// Stats counters (atomic)
 	statFECShardsRecv       uint64
@@ -410,6 +418,66 @@ func (t *Tunnel) logStatsLoop() {
 			}
 		}
 	}()
+}
+
+func (t *Tunnel) handleRecoveredBatch(peerAddr string, sessionID uint32, packets [][]byte, deliver func([]byte)) {
+	if len(packets) == 0 {
+		return
+	}
+	const reorderTimeout = 30 * time.Millisecond
+
+	t.fecReorderMux.Lock()
+	buf := t.fecReorderBufs[peerAddr]
+	if buf == nil {
+		buf = &fecReorderBuffer{
+			next:       sessionID,
+			pending:    make(map[uint32][][]byte),
+			lastUpdate: time.Now(),
+		}
+		t.fecReorderBufs[peerAddr] = buf
+	}
+
+	buf.pending[sessionID] = packets
+	buf.lastUpdate = time.Now()
+
+	var toDeliver [][]byte
+	for {
+		pkts, ok := buf.pending[buf.next]
+		if !ok {
+			break
+		}
+		delete(buf.pending, buf.next)
+		buf.next++
+		toDeliver = append(toDeliver, pkts...)
+	}
+
+	if len(toDeliver) == 0 && len(buf.pending) > 0 && time.Since(buf.lastUpdate) > reorderTimeout {
+		// Resync to the smallest available session ID
+		var min uint32
+		first := true
+		for sid := range buf.pending {
+			if first || sid < min {
+				min = sid
+				first = false
+			}
+		}
+		buf.next = min
+		if pkts, ok := buf.pending[buf.next]; ok {
+			delete(buf.pending, buf.next)
+			buf.next++
+			toDeliver = append(toDeliver, pkts...)
+		}
+	}
+
+	if len(buf.pending) == 0 && time.Since(buf.lastUpdate) > 5*reorderTimeout {
+		delete(t.fecReorderBufs, peerAddr)
+	}
+
+	t.fecReorderMux.Unlock()
+
+	for _, pkt := range toDeliver {
+		deliver(pkt)
+	}
 }
 
 // nextFECSessionID generates a unique FEC session ID in a thread-safe manner.
@@ -572,6 +640,7 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 		fecEnabled:         cfg.FECDataShards > 0 && cfg.FECParityShards > 0,
 		fecRecvSessions:    make(map[string]*fecRecvSession),
 		fecSessionID:       uint32(time.Now().UnixNano()),
+		fecReorderBufs:     make(map[string]*fecReorderBuffer),
 	}
 	t.packetPool = &sync.Pool{
 		New: func() any {
@@ -1695,21 +1764,21 @@ func (t *Tunnel) netReader() {
 		// FEC shards are NOT encrypted themselves - they contain pieces of encrypted data
 		if len(packet) > 0 && packet[0] == PacketTypeFECShard {
 			if t.fecEnabled {
-				reconstructedPackets, err := t.processFECShard(t.config.RemoteAddr, packet[1:])
+				sessionID, reconstructedPackets, err := t.processFECShard(t.config.RemoteAddr, packet[1:])
 				if err != nil {
 					log.Printf("FEC shard processing error: %v", err)
 					continue
 				}
 
-				for _, reconstructedPacket := range reconstructedPackets {
+				t.handleRecoveredBatch(t.config.RemoteAddr, sessionID, reconstructedPackets, func(reconstructedPacket []byte) {
 					decryptedPacket, err := t.decryptPacket(reconstructedPacket)
 					if err != nil {
 						log.Printf("FEC reconstructed packet decryption error: %v", err)
-						continue
+						return
 					}
 
 					if len(decryptedPacket) < 1 {
-						continue
+						return
 					}
 
 					packetType := decryptedPacket[0]
@@ -1726,7 +1795,7 @@ func (t *Tunnel) netReader() {
 							}
 						}
 					}
-				}
+				})
 			}
 			continue
 		}
@@ -2127,17 +2196,17 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 		// FEC shards are NOT encrypted themselves - they contain pieces of encrypted data
 		if len(packet) > 0 && packet[0] == PacketTypeFECShard {
 			if t.fecEnabled {
-				reconstructedPackets, err := t.processFECShard(client.conn.RemoteAddr().String(), packet[1:])
+				sessionID, reconstructedPackets, err := t.processFECShard(client.conn.RemoteAddr().String(), packet[1:])
 				if err != nil {
 					log.Printf("FEC shard processing error from client %s: %v", client.conn.RemoteAddr(), err)
 					continue
 				}
 
-				for _, reconstructedPacket := range reconstructedPackets {
+				t.handleRecoveredBatch(client.conn.RemoteAddr().String(), sessionID, reconstructedPackets, func(reconstructedPacket []byte) {
 					decryptedPacket, usedCipher, gen, err := t.decryptPacketFromClient(client, reconstructedPacket)
 					if err != nil {
 						log.Printf("FEC reconstructed packet decryption error from %s: %v", client.conn.RemoteAddr(), err)
-						continue
+						return
 					}
 					if usedCipher != nil {
 						client.setCipherWithGen(usedCipher, gen)
@@ -2145,7 +2214,7 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 					if !t.handleClientPacket(client, decryptedPacket) {
 						return
 					}
-				}
+				})
 				continue
 			}
 			continue
@@ -4178,10 +4247,10 @@ func (t *Tunnel) sendBatchWithFEC(conn faketcp.ConnAdapter, packets [][]byte, pa
 
 // processFECShard handles a received FEC shard and attempts to reconstruct original packets.
 // Returns reconstructed packets if complete, or nil if more shards are needed.
-func (t *Tunnel) processFECShard(peerAddr string, fecPacket []byte) ([][]byte, error) {
+func (t *Tunnel) processFECShard(peerAddr string, fecPacket []byte) (uint32, [][]byte, error) {
 	// FEC header: sessionID(4) + shardIndex(2) + dataShards(2) + parityShards(2) + shardSize(2) = 12 bytes minimum
 	if len(fecPacket) < 12 {
-		return nil, errors.New("FEC packet too short")
+		return 0, nil, errors.New("FEC packet too short")
 	}
 
 	// Parse FEC header (PacketTypeFECShard already stripped by caller)
@@ -4194,25 +4263,25 @@ func (t *Tunnel) processFECShard(peerAddr string, fecPacket []byte) ([][]byte, e
 	atomic.AddUint64(&t.statFECShardsRecv, 1)
 
 	if dataShards <= 0 || parityShards <= 0 {
-		return nil, fmt.Errorf("FEC shard counts invalid: data=%d parity=%d", dataShards, parityShards)
+		return 0, nil, fmt.Errorf("FEC shard counts invalid: data=%d parity=%d", dataShards, parityShards)
 	}
 	if shardSize <= 2 {
-		return nil, fmt.Errorf("FEC shard size invalid: %d", shardSize)
+		return 0, nil, fmt.Errorf("FEC shard size invalid: %d", shardSize)
 	}
 	// Ensure shard size fits within raw TCP segment to avoid re-segmentation
 	const maxRawTCPSegment = 1400
 	const fecHeaderOverhead = 1 + 4 + 2 + 2 + 2 + 2
 	maxShardPayload := maxRawTCPSegment - fecHeaderOverhead
 	if shardSize > maxShardPayload {
-		return nil, fmt.Errorf("FEC shard size too large: %d > %d", shardSize, maxShardPayload)
+		return 0, nil, fmt.Errorf("FEC shard size too large: %d > %d", shardSize, maxShardPayload)
 	}
 
 	totalShards := dataShards + parityShards
 	if shardIndex >= totalShards {
-		return nil, fmt.Errorf("FEC shard index out of range: %d >= %d", shardIndex, totalShards)
+		return 0, nil, fmt.Errorf("FEC shard index out of range: %d >= %d", shardIndex, totalShards)
 	}
 	if len(shardData) != shardSize {
-		return nil, fmt.Errorf("FEC shard size mismatch: expected %d, got %d", shardSize, len(shardData))
+		return 0, nil, fmt.Errorf("FEC shard size mismatch: expected %d, got %d", shardSize, len(shardData))
 	}
 
 	// Create unique session key using peer address and session ID
@@ -4239,7 +4308,7 @@ func (t *Tunnel) processFECShard(peerAddr string, fecPacket []byte) ([][]byte, e
 	if session.dataShards != dataShards || session.parityShards != parityShards || session.expectedShardSize != shardSize {
 		delete(t.fecRecvSessions, sessionKey)
 		t.fecRecvMux.Unlock()
-		return nil, fmt.Errorf("FEC session %s: shard metadata mismatch", sessionKey)
+		return 0, nil, fmt.Errorf("FEC session %s: shard metadata mismatch", sessionKey)
 	}
 
 	t.fecRecvMux.Unlock()
@@ -4270,9 +4339,9 @@ func (t *Tunnel) processFECShard(peerAddr string, fecPacket []byte) ([][]byte, e
 				delete(t.fecRecvSessions, sessionKey)
 				t.fecRecvMux.Unlock()
 				atomic.AddUint64(&t.statFECSessionsUnrecoverable, 1)
-				return nil, nil
+				return sessionID, nil, nil
 			}
-			return nil, nil // Need more shards
+			return sessionID, nil, nil // Need more shards
 		}
 
 		// Extract data packets
@@ -4298,10 +4367,10 @@ func (t *Tunnel) processFECShard(peerAddr string, fecPacket []byte) ([][]byte, e
 
 		atomic.AddUint64(&t.statFECSessionsRecovered, 1)
 		atomic.AddUint64(&t.statFECPacketsRecovered, uint64(len(packets)))
-		return packets, nil
+		return sessionID, packets, nil
 	}
 
-	return nil, nil
+	return sessionID, nil, nil
 }
 
 // cleanupStaleFECSessions removes old FEC sessions that haven't been updated
