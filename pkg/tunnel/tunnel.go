@@ -441,8 +441,9 @@ func (t *Tunnel) handleRecoveredBatch(peerAddr string, sessionID uint32, packets
 	if len(packets) == 0 {
 		return
 	}
-	const reorderTimeout = 500 * time.Millisecond
-	const reorderWindowSize = 64 // Allow up to 64 out-of-order batches
+	// Reduced timeout to 50ms to minimize TCP stall duration on loss while allowing some reordering
+	const reorderTimeout = 50 * time.Millisecond
+	const reorderWindowSize = 128 // Increased window size to tolerate more reordering
 
 	t.fecReorderMux.Lock()
 	buf := t.fecReorderBufs[peerAddr]
@@ -454,8 +455,10 @@ func (t *Tunnel) handleRecoveredBatch(peerAddr string, sessionID uint32, packets
 		}
 		t.fecReorderBufs[peerAddr] = buf
 	}
+
+	// Case 1: Late batch (already processed/skipped this sessionID)
+	// We drop TCP to preserve ordering, but always allow UDP to pass through to reduce latency/stall
 	if sessionID < buf.next {
-		// Late batch; drop TCP to preserve ordering, allow UDP to reduce stall
 		atomic.AddUint64(&t.statFECLateBatchDrop, 1)
 		t.fecReorderMux.Unlock()
 		for _, pkt := range packets {
@@ -466,30 +469,20 @@ func (t *Tunnel) handleRecoveredBatch(peerAddr string, sessionID uint32, packets
 		return
 	}
 
-	// Sliding window delivery: deliver if within window, regardless of gaps
+	// Case 2: Within window - Buffer it
 	windowEnd := buf.next + reorderWindowSize
 	if sessionID >= buf.next && sessionID < windowEnd {
-		// Within window: store and deliver immediately
 		buf.pending[sessionID] = packets
 		buf.lastUpdate = time.Now()
-	} else if sessionID < buf.next {
-		// Late batch: allow UDP packets through, drop TCP
-		atomic.AddUint64(&t.statFECLateBatchDrop, 1)
-		t.fecReorderMux.Unlock()
-		for _, pkt := range packets {
-			if isUDPPacket(pkt) {
-				deliver(pkt)
-			}
-		}
-		return
 	} else {
-		// Beyond window: skip forward and deliver
+		// Case 3: Beyond window - Force move window to catch up
+		// This happens if we fell way behind or the peer reset/jumped ahead
 		gapSize := sessionID - buf.next
 		atomic.AddUint64(&t.statFECGapSkip, uint64(gapSize))
 		buf.next = sessionID
 		buf.pending[sessionID] = packets
 		buf.lastUpdate = time.Now()
-		// Clear old pending entries
+		// Clear old pending entries that are now behind `buf.next`
 		for sid := range buf.pending {
 			if sid < buf.next {
 				delete(buf.pending, sid)
@@ -497,31 +490,30 @@ func (t *Tunnel) handleRecoveredBatch(peerAddr string, sessionID uint32, packets
 		}
 	}
 
-	// Deliver all pending packets within window (allow gaps)
+	// Delivery Loop: STRICTLY SEQUENTIAL
+	// Only deliver packets that match buf.next
 	var toDeliver [][]byte
-	var maxDelivered uint32
-	hasDelivered := false
-	for sid := buf.next; sid < windowEnd; sid++ {
-		if pkts, ok := buf.pending[sid]; ok {
+	for {
+		if pkts, ok := buf.pending[buf.next]; ok {
 			toDeliver = append(toDeliver, pkts...)
-			delete(buf.pending, sid)
-			if !hasDelivered || sid > maxDelivered {
-				maxDelivered = sid
-				hasDelivered = true
-			}
+			delete(buf.pending, buf.next)
+			buf.next++
+			// We successfully advanced, so reset the gap timer
+			buf.gapSince = time.Time{}
+		} else {
+			// Gap detected! Stop delivery and wait for the missing batch or timeout.
+			break
 		}
 	}
-	// Advance next to after the maximum delivered session
-	if hasDelivered && maxDelivered >= buf.next {
-		buf.next = maxDelivered + 1
-	}
 
-	// Timeout-based cleanup: advance next pointer if gap persists too long
+	// Timeout-based skipping logic
 	if len(buf.pending) > 0 {
+		// We have future packets buffered, but we are stuck at buf.next (gap)
 		if buf.gapSince.IsZero() {
 			buf.gapSince = time.Now()
 		} else if time.Since(buf.gapSince) > reorderTimeout {
-			// Find next available session after gap timeout
+			// Timeout reached! Give up on waiting for buf.next
+			// Find the NEXT available session ID in our buffer
 			var minAvailable uint32
 			found := false
 			for sid := range buf.pending {
@@ -531,17 +523,27 @@ func (t *Tunnel) handleRecoveredBatch(peerAddr string, sessionID uint32, packets
 				}
 			}
 			if found {
-				atomic.AddUint64(&t.statFECGapSkip, uint64(minAvailable-buf.next))
+				// Skip the gap up to minAvailable
+				gap := minAvailable - buf.next
+				atomic.AddUint64(&t.statFECGapSkip, uint64(gap))
 				buf.next = minAvailable
 				buf.gapSince = time.Time{}
+
+				// Deliver the packet we just jumped to
+				if pkts, ok := buf.pending[buf.next]; ok {
+					toDeliver = append(toDeliver, pkts...)
+					delete(buf.pending, buf.next)
+					buf.next++
+				}
 			}
 		}
 	} else {
+		// No pending packets, so no gap to track
 		buf.gapSince = time.Time{}
 	}
 
 	// Cleanup old buffer if idle
-	if len(buf.pending) == 0 && time.Since(buf.lastUpdate) > 5*reorderTimeout {
+	if len(buf.pending) == 0 && time.Since(buf.lastUpdate) > 10*time.Second {
 		delete(t.fecReorderBufs, peerAddr)
 	}
 
