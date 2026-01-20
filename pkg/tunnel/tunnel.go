@@ -261,6 +261,19 @@ type Tunnel struct {
 	fecRecvMux       sync.Mutex                  // Protects fecRecvSessions
 	fecCleanupTicker *time.Ticker                // Ticker for cleaning up stale FEC sessions
 
+	// Stats counters (atomic)
+	statFECShardsRecv       uint64
+	statFECSessionsRecovered uint64
+	statFECSessionsUnrecoverable uint64
+	statFECPacketsRecovered uint64
+	statQueueDropSend       uint64
+	statQueueDropRecv       uint64
+	statQueueDropClientSend uint64
+	statQueueDropRouteSend  uint64
+	statQueueDropForward    uint64
+	statOversizedDrop       uint64
+	statFragmentsGenerated  uint64
+
 	// Authentication state (for encrypt_after_auth mode)
 	authenticated    bool              // Whether client is authenticated (client mode)
 	authMux          sync.Mutex        // Protects authenticated flag
@@ -368,6 +381,35 @@ func (t *Tunnel) releasePacketBuffer(buf []byte) {
 	if cap(buf) >= t.packetBufSize {
 		t.packetPool.Put(buf[:t.packetBufSize])
 	}
+}
+
+func (t *Tunnel) logStatsLoop() {
+	t.wg.Add(1)
+	go func() {
+		defer t.wg.Done()
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-t.stopCh:
+				return
+			case <-ticker.C:
+				log.Printf("Stats: fec_shards=%d fec_recovered_sessions=%d fec_unrecoverable=%d fec_packets_recovered=%d drops_send=%d drops_recv=%d drops_client_send=%d drops_route=%d drops_forward=%d oversized_drop=%d fragments=%d",
+					atomic.LoadUint64(&t.statFECShardsRecv),
+					atomic.LoadUint64(&t.statFECSessionsRecovered),
+					atomic.LoadUint64(&t.statFECSessionsUnrecoverable),
+					atomic.LoadUint64(&t.statFECPacketsRecovered),
+					atomic.LoadUint64(&t.statQueueDropSend),
+					atomic.LoadUint64(&t.statQueueDropRecv),
+					atomic.LoadUint64(&t.statQueueDropClientSend),
+					atomic.LoadUint64(&t.statQueueDropRouteSend),
+					atomic.LoadUint64(&t.statQueueDropForward),
+					atomic.LoadUint64(&t.statOversizedDrop),
+					atomic.LoadUint64(&t.statFragmentsGenerated),
+				)
+			}
+		}
+	}()
 }
 
 // nextFECSessionID generates a unique FEC session ID in a thread-safe manner.
@@ -630,6 +672,8 @@ func (t *Tunnel) Start() error {
 	if t.fecEnabled {
 		t.startFECCleanup()
 	}
+	// Start stats logger
+	t.logStatsLoop()
 
 	// Establish connection based on mode
 	if t.config.Mode == "client" {
@@ -1302,9 +1346,11 @@ func (t *Tunnel) tunReader() {
 				fragments, err := fragmentIPv4Packet(readBuf[:n], t.config.MTU)
 				t.releasePacketBuffer(buf)
 				if err != nil {
+					atomic.AddUint64(&t.statOversizedDrop, 1)
 					log.Printf("⚠️  Failed to fragment oversized packet (%d bytes): %v", n, err)
 					continue
 				}
+				atomic.AddUint64(&t.statFragmentsGenerated, uint64(len(fragments)))
 
 				for _, frag := range fragments {
 					if t.config.P2PEnabled && t.routingTable != nil {
@@ -1343,6 +1389,7 @@ func (t *Tunnel) tunReader() {
 			} else {
 				// Default: queue for server
 				if !enqueueWithPolicy(t.sendQueue, packet, t.stopCh, t.fecEnabled) {
+					atomic.AddUint64(&t.statQueueDropSend, 1)
 					t.releasePacketBuffer(buf)
 					select {
 					case <-t.stopCh:
@@ -1395,9 +1442,11 @@ func (t *Tunnel) tunReaderServer() {
 			fragments, err := fragmentIPv4Packet(readBuf[:n], t.config.MTU)
 			t.releasePacketBuffer(buf)
 			if err != nil {
+				atomic.AddUint64(&t.statOversizedDrop, 1)
 				log.Printf("⚠️  Failed to fragment oversized packet (%d bytes): %v", n, err)
 				continue
 			}
+			atomic.AddUint64(&t.statFragmentsGenerated, uint64(len(fragments)))
 
 			for _, frag := range fragments {
 				if frag[0]>>4 != IPv4Version {
@@ -1465,6 +1514,7 @@ func (t *Tunnel) tunReaderServer() {
 		if client != nil {
 			queued := enqueueWithClientPolicy(client.sendQueue, packet, t.stopCh, client.stopCh, t.fecEnabled)
 			if !queued {
+				atomic.AddUint64(&t.statQueueDropClientSend, 1)
 				log.Printf("⚠️  Client send queue full for %s after timeout, dropping packet", dstIP)
 				t.releasePacketBuffer(buf)
 			}
@@ -1473,6 +1523,7 @@ func (t *Tunnel) tunReaderServer() {
 			if routeClient := t.findRouteClient(dstIP); routeClient != nil {
 				queued := enqueueWithClientPolicy(routeClient.sendQueue, packet, t.stopCh, routeClient.stopCh, t.fecEnabled)
 				if !queued {
+					atomic.AddUint64(&t.statQueueDropRouteSend, 1)
 					log.Printf("⚠️  Route client queue full for %s after timeout, dropping packet", dstIP)
 					t.releasePacketBuffer(buf)
 				}
@@ -1666,6 +1717,7 @@ func (t *Tunnel) netReader() {
 
 					if packetType == PacketTypeData {
 						if !enqueueWithPolicy(t.recvQueue, payload, t.stopCh, t.fecEnabled) {
+							atomic.AddUint64(&t.statQueueDropRecv, 1)
 							select {
 							case <-t.stopCh:
 								return
@@ -1698,6 +1750,7 @@ func (t *Tunnel) netReader() {
 		case PacketTypeData:
 			// Queue for TUN device
 			if !enqueueWithPolicy(t.recvQueue, payload, t.stopCh, t.fecEnabled) {
+				atomic.AddUint64(&t.statQueueDropRecv, 1)
 				select {
 				case <-t.stopCh:
 					return
@@ -2170,6 +2223,7 @@ func (t *Tunnel) handleClientPacket(client *ClientConnection, packet []byte) boo
 
 					queued := enqueueWithClientPolicy(targetClient.sendQueue, forwardPacket, t.stopCh, client.stopCh, t.fecEnabled)
 					if !queued {
+						atomic.AddUint64(&t.statQueueDropForward, 1)
 						log.Printf("⚠️  Target client send queue full for %s after timeout, dropping packet", dstIP)
 						t.releasePacketBuffer(forwardBuf)
 					}
@@ -4137,6 +4191,7 @@ func (t *Tunnel) processFECShard(peerAddr string, fecPacket []byte) ([][]byte, e
 	parityShards := int(fecPacket[8])<<8 | int(fecPacket[9])
 	shardSize := int(fecPacket[10])<<8 | int(fecPacket[11])
 	shardData := fecPacket[12:]
+	atomic.AddUint64(&t.statFECShardsRecv, 1)
 
 	if dataShards <= 0 || parityShards <= 0 {
 		return nil, fmt.Errorf("FEC shard counts invalid: data=%d parity=%d", dataShards, parityShards)
@@ -4214,6 +4269,7 @@ func (t *Tunnel) processFECShard(peerAddr string, fecPacket []byte) ([][]byte, e
 				t.fecRecvMux.Lock()
 				delete(t.fecRecvSessions, sessionKey)
 				t.fecRecvMux.Unlock()
+				atomic.AddUint64(&t.statFECSessionsUnrecoverable, 1)
 				return nil, nil
 			}
 			return nil, nil // Need more shards
@@ -4240,6 +4296,8 @@ func (t *Tunnel) processFECShard(peerAddr string, fecPacket []byte) ([][]byte, e
 		delete(t.fecRecvSessions, sessionKey)
 		t.fecRecvMux.Unlock()
 
+		atomic.AddUint64(&t.statFECSessionsRecovered, 1)
+		atomic.AddUint64(&t.statFECPacketsRecovered, uint64(len(packets)))
 		return packets, nil
 	}
 
