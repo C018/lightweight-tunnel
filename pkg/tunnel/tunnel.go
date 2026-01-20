@@ -394,6 +394,17 @@ func (t *Tunnel) releasePacketBuffer(buf []byte) {
 	}
 }
 
+// isUDPPacket reports whether the inner packet is IPv4 UDP.
+func isUDPPacket(packet []byte) bool {
+	if len(packet) < IPv4MinHeaderLen {
+		return false
+	}
+	if packet[0]>>4 != IPv4Version {
+		return false
+	}
+	return packet[IPv4ProtocolOffset] == 17
+}
+
 func (t *Tunnel) logStatsLoop() {
 	t.wg.Add(1)
 	go func() {
@@ -442,9 +453,14 @@ func (t *Tunnel) handleRecoveredBatch(peerAddr string, sessionID uint32, packets
 		t.fecReorderBufs[peerAddr] = buf
 	}
 	if sessionID < buf.next {
-		// Late batch; drop to preserve ordering
+		// Late batch; drop TCP to preserve ordering, allow UDP to reduce stall
 		atomic.AddUint64(&t.statFECLateBatchDrop, 1)
 		t.fecReorderMux.Unlock()
+		for _, pkt := range packets {
+			if isUDPPacket(pkt) {
+				deliver(pkt)
+			}
+		}
 		return
 	}
 
