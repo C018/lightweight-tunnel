@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode"
@@ -123,6 +124,7 @@ type fecRecvSession struct {
 	receivedCount int      // Number of shards received so far
 	lastUpdate    time.Time // Last time a shard was received
 	originalSize  int      // Original packet size before FEC encoding
+	expectedShardSize int  // Expected shard size for this session
 }
 
 // ConfigUpdateMessage carries server-pushed configuration updates.
@@ -259,6 +261,11 @@ func (t *Tunnel) releasePacketBuffer(buf []byte) {
 	}
 }
 
+// nextFECSessionID generates a unique FEC session ID in a thread-safe manner.
+func (t *Tunnel) nextFECSessionID() uint32 {
+	return atomic.AddUint32(&t.fecSessionID, 1)
+}
+
 // NewTunnel creates a new tunnel instance
 func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 	// Force rawtcp mode - this is the only supported transport now
@@ -346,6 +353,34 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 				log.Printf("⚠️  Adjusting MTU from %d to %d to prevent TCP segmentation of encrypted packets", cfg.MTU, maxSafeMTU)
 				cfg.MTU = maxSafeMTU
 			}
+		}
+	}
+
+	// Additional MTU adjustment for FEC: ensure FEC shards fit within raw TCP segments
+	if cfg.Transport == "rawtcp" && cfg.FECDataShards > 0 && cfg.FECParityShards > 0 {
+		const maxRawTCPSegment = 1400
+		const fecHeaderOverhead = 1 + 4 + 2 + 2 + 4 // PacketType + sessionID + shardIndex + totalShards + originalSize
+		const packetTypeOverhead = 1
+
+		encryptionOverhead := 0
+		if cipher != nil {
+			encryptionOverhead = cipher.Overhead()
+		}
+
+		maxShardPayload := maxRawTCPSegment - fecHeaderOverhead
+		if maxShardPayload < 1 {
+			return nil, fmt.Errorf("invalid FEC header overhead (%d) for raw TCP segment size", fecHeaderOverhead)
+		}
+
+		maxEncryptedLen := cfg.FECDataShards * maxShardPayload
+		maxSafeMTU := maxEncryptedLen - packetTypeOverhead - encryptionOverhead
+		if maxSafeMTU < 1 {
+			return nil, fmt.Errorf("FEC configuration too small for raw TCP segmentation (fec_data=%d)", cfg.FECDataShards)
+		}
+
+		if cfg.MTU > maxSafeMTU {
+			log.Printf("⚠️  Adjusting MTU from %d to %d to prevent FEC shard segmentation", cfg.MTU, maxSafeMTU)
+			cfg.MTU = maxSafeMTU
 		}
 	}
 
@@ -2986,7 +3021,7 @@ func (t *Tunnel) encryptPacket(data []byte) ([]byte, error) {
 		// Control packets (keepalive, peer info, etc.) are always encrypted
 	}
 	
-	if t.shouldSkipOuterEncryption(data) {
+	if !t.fecEnabled && t.shouldSkipOuterEncryption(data) {
 		return data, nil
 	}
 	return c.Encrypt(data)
@@ -3079,7 +3114,7 @@ func (t *Tunnel) decryptPacketFromClient(client *ClientConnection, data []byte) 
 }
 
 func (t *Tunnel) encryptForClient(client *ClientConnection, data []byte) ([]byte, error) {
-	if t.shouldSkipOuterEncryption(data) {
+	if !t.fecEnabled && t.shouldSkipOuterEncryption(data) {
 		return data, nil
 	}
 	
@@ -3784,8 +3819,7 @@ func (t *Tunnel) sendPacketWithFEC(conn faketcp.ConnAdapter, packet []byte) erro
 	}
 	
 	// Get next session ID
-	sessionID := t.fecSessionID
-	t.fecSessionID++
+	sessionID := t.nextFECSessionID()
 	
 	// FEC encode the packet
 	shards, err := t.fec.Encode(packet)
@@ -3890,6 +3924,7 @@ func (t *Tunnel) processFECShard(peerAddr string, fecPacket []byte) ([]byte, err
 			receivedCount: 0,
 			lastUpdate:    time.Now(),
 			originalSize:  originalSize,
+			expectedShardSize: len(shardData),
 		}
 		t.fecRecvSessions[sessionKey] = session
 	}
@@ -3902,6 +3937,14 @@ func (t *Tunnel) processFECShard(peerAddr string, fecPacket []byte) ([]byte, err
 	
 	t.fecRecvMux.Unlock()
 	
+	// Validate shard size consistency
+	if session.expectedShardSize != 0 && len(shardData) != session.expectedShardSize {
+		t.fecRecvMux.Lock()
+		delete(t.fecRecvSessions, sessionKey)
+		t.fecRecvMux.Unlock()
+		return nil, fmt.Errorf("FEC session %s: shard size mismatch (%d vs %d)", sessionKey, len(shardData), session.expectedShardSize)
+	}
+
 	// Add shard to session
 	if !session.shardPresent[shardIndex] {
 		session.shards[shardIndex] = make([]byte, len(shardData))
