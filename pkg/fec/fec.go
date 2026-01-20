@@ -10,7 +10,7 @@ import (
 var ErrIncomplete = errors.New("not enough shards to reconstruct data")
 
 // ErrUnrecoverable indicates that too many shards have been lost to ever reconstruct the data
-var ErrUnrecoverable = errors.New("too many missing data shards for XOR FEC reconstruction")
+var ErrUnrecoverable = errors.New("too many missing shards for Reed-Solomon reconstruction")
 
 // FEC implements Forward Error Correction using Reed-Solomon codes
 type FEC struct {

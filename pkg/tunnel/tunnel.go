@@ -357,11 +357,12 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 		}
 	}
 
-	// Additional MTU adjustment for FEC: ensure FEC shards fit within raw TCP segments
+	// Additional MTU adjustment for cross-packet FEC: ensure each shard fits within raw TCP segments
 	if cfg.Transport == "rawtcp" && cfg.FECDataShards > 0 && cfg.FECParityShards > 0 {
 		const maxRawTCPSegment = 1400
-		const fecHeaderOverhead = 1 + 4 + 2 + 2 + 4 // PacketType + sessionID + shardIndex + totalShards + originalSize
+		const fecHeaderOverhead = 1 + 4 + 2 + 2 + 2 + 2 // PacketType + sessionID + shardIndex + dataShards + parityShards + shardSize
 		const packetTypeOverhead = 1
+		const lengthPrefixOverhead = 2
 
 		encryptionOverhead := 0
 		if cipher != nil {
@@ -373,10 +374,11 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 			return nil, fmt.Errorf("invalid FEC header overhead (%d) for raw TCP segment size", fecHeaderOverhead)
 		}
 
-		maxEncryptedLen := cfg.FECDataShards * maxShardPayload
-		maxSafeMTU := maxEncryptedLen - packetTypeOverhead - encryptionOverhead
+		// Encrypted packet length = MTU + packetType + encryptionOverhead
+		// Shard payload = lengthPrefix + encryptedPacket
+		maxSafeMTU := maxShardPayload - lengthPrefixOverhead - packetTypeOverhead - encryptionOverhead
 		if maxSafeMTU < 1 {
-			return nil, fmt.Errorf("FEC configuration too small for raw TCP segmentation (fec_data=%d)", cfg.FECDataShards)
+			return nil, fmt.Errorf("FEC configuration too small for raw TCP segmentation")
 		}
 
 		if cfg.MTU > maxSafeMTU {
@@ -4017,6 +4019,13 @@ func (t *Tunnel) processFECShard(peerAddr string, fecPacket []byte) ([][]byte, e
 	}
 	if shardSize <= 2 {
 		return nil, fmt.Errorf("FEC shard size invalid: %d", shardSize)
+	}
+	// Ensure shard size fits within raw TCP segment to avoid re-segmentation
+	const maxRawTCPSegment = 1400
+	const fecHeaderOverhead = 1 + 4 + 2 + 2 + 2 + 2
+	maxShardPayload := maxRawTCPSegment - fecHeaderOverhead
+	if shardSize > maxShardPayload {
+		return nil, fmt.Errorf("FEC shard size too large: %d > %d", shardSize, maxShardPayload)
 	}
 
 	totalShards := dataShards + parityShards
