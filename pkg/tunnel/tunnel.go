@@ -288,7 +288,7 @@ type Tunnel struct {
 
 	// Authentication state (for encrypt_after_auth mode)
 	authenticated    bool              // Whether client is authenticated (client mode)
-	authMux          sync.Mutex        // Protects authenticated flag
+	authMux          sync.RWMutex      // Protects authenticated flag
 	authResponseChan chan error        // Channel for receiving auth response (client mode)
 
 	// Work queue for parallel FEC processing
