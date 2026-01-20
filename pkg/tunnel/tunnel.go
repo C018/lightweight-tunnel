@@ -25,6 +25,7 @@ import (
 	"github.com/openbmx/lightweight-tunnel/pkg/fec"
 	"github.com/openbmx/lightweight-tunnel/pkg/nat"
 	"github.com/openbmx/lightweight-tunnel/pkg/p2p"
+	"github.com/openbmx/lightweight-tunnel/pkg/rawsocket"
 	"github.com/openbmx/lightweight-tunnel/pkg/routing"
 	"github.com/openbmx/lightweight-tunnel/pkg/xdp"
 )
@@ -291,6 +292,71 @@ func (t *Tunnel) getPacketBuffer() []byte {
 		return make([]byte, t.config.MTU+packetBufferSlack)
 	}
 	return t.packetPool.Get().([]byte)
+}
+
+// fragmentIPv4Packet splits an IPv4 packet into MTU-sized fragments.
+// Returns fragments with updated headers and checksums.
+func fragmentIPv4Packet(packet []byte, mtu int) ([][]byte, error) {
+	if len(packet) < IPv4MinHeaderLen {
+		return nil, errors.New("packet too small for IPv4")
+	}
+	if packet[0]>>4 != IPv4Version {
+		return nil, errors.New("not IPv4 packet")
+	}
+	ihl := int(packet[0]&0x0F) * 4
+	if ihl < IPv4MinHeaderLen || ihl > len(packet) {
+		return nil, errors.New("invalid IPv4 header length")
+	}
+	if mtu <= ihl+8 {
+		return nil, errors.New("MTU too small for fragmentation")
+	}
+
+	payload := packet[ihl:]
+	maxPayload := mtu - ihl
+	maxPayload &= ^7 // must be multiple of 8
+	if maxPayload <= 0 {
+		return nil, errors.New("invalid fragment payload size")
+	}
+
+	flagsOffset := binary.BigEndian.Uint16(packet[6:8])
+	reserved := flagsOffset & 0x8000
+	ident := packet[4:6]
+
+	var fragments [][]byte
+	for offset := 0; offset < len(payload); offset += maxPayload {
+		end := offset + maxPayload
+		if end > len(payload) {
+			end = len(payload)
+		}
+		fragPayload := payload[offset:end]
+
+		frag := make([]byte, ihl+len(fragPayload))
+		copy(frag[:ihl], packet[:ihl])
+		copy(frag[ihl:], fragPayload)
+
+		// Total length
+		binary.BigEndian.PutUint16(frag[2:4], uint16(len(frag)))
+		// Identification
+		copy(frag[4:6], ident)
+
+		// Flags + Fragment offset
+		offsetUnits := uint16(offset / 8)
+		flagBits := reserved
+		if end < len(payload) {
+			flagBits |= 0x2000 // MF
+		}
+		binary.BigEndian.PutUint16(frag[6:8], flagBits|offsetUnits)
+
+		// Clear checksum and recalc
+		frag[10] = 0
+		frag[11] = 0
+		checksum := rawsocket.CalculateChecksum(frag[:ihl])
+		binary.BigEndian.PutUint16(frag[10:12], checksum)
+
+		fragments = append(fragments, frag)
+	}
+
+	return fragments, nil
 }
 
 // releasePacketBuffer returns a buffer to the pool when it matches the
@@ -1233,8 +1299,33 @@ func (t *Tunnel) tunReader() {
 			}
 
 			if n > t.config.MTU {
-				log.Printf("⚠️  Dropping oversized TUN packet: %d > MTU %d", n, t.config.MTU)
+				fragments, err := fragmentIPv4Packet(readBuf[:n], t.config.MTU)
 				t.releasePacketBuffer(buf)
+				if err != nil {
+					log.Printf("⚠️  Failed to fragment oversized packet (%d bytes): %v", n, err)
+					continue
+				}
+
+				for _, frag := range fragments {
+					if t.config.P2PEnabled && t.routingTable != nil {
+						queued, err := t.sendPacketWithRouting(frag)
+						if err != nil {
+							log.Printf("Failed to send fragment: %v", err)
+						}
+						if !queued {
+							// sendPacketWithRouting handled release if queued; nothing to release here
+						}
+					} else {
+						if !enqueueWithPolicy(t.sendQueue, frag, t.stopCh, t.fecEnabled) {
+							select {
+							case <-t.stopCh:
+								return
+							default:
+								log.Printf("Send queue full after timeout, dropping fragment")
+							}
+						}
+					}
+				}
 				continue
 			}
 
@@ -1301,8 +1392,34 @@ func (t *Tunnel) tunReaderServer() {
 		}
 
 		if n > t.config.MTU {
-			log.Printf("⚠️  Dropping oversized TUN packet: %d > MTU %d", n, t.config.MTU)
+			fragments, err := fragmentIPv4Packet(readBuf[:n], t.config.MTU)
 			t.releasePacketBuffer(buf)
+			if err != nil {
+				log.Printf("⚠️  Failed to fragment oversized packet (%d bytes): %v", n, err)
+				continue
+			}
+
+			for _, frag := range fragments {
+				if frag[0]>>4 != IPv4Version {
+					continue
+				}
+				dstIP := net.IP(frag[IPv4DstIPOffset : IPv4DstIPOffset+4])
+				client := t.getClientByIP(dstIP)
+				if client != nil {
+					queued := enqueueWithClientPolicy(client.sendQueue, frag, t.stopCh, client.stopCh, t.fecEnabled)
+					if !queued {
+						log.Printf("⚠️  Client send queue full for %s after timeout, dropping fragment", dstIP)
+					}
+					continue
+				}
+				if routeClient := t.findRouteClient(dstIP); routeClient != nil {
+					queued := enqueueWithClientPolicy(routeClient.sendQueue, frag, t.stopCh, routeClient.stopCh, t.fecEnabled)
+					if !queued {
+						log.Printf("⚠️  Route client queue full for %s after timeout, dropping fragment", dstIP)
+					}
+					continue
+				}
+			}
 			continue
 		}
 
