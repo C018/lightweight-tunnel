@@ -1431,8 +1431,10 @@ func (t *Tunnel) tunReader() {
 				atomic.AddUint64(&t.statFragmentsGenerated, uint64(len(fragments)))
 
 				for _, frag := range fragments {
+					fragCopy := make([]byte, len(frag))
+					copy(fragCopy, frag)
 					if t.config.P2PEnabled && t.routingTable != nil {
-						queued, err := t.sendPacketWithRouting(frag)
+						queued, err := t.sendPacketWithRouting(fragCopy)
 						if err != nil {
 							log.Printf("Failed to send fragment: %v", err)
 						}
@@ -1440,7 +1442,7 @@ func (t *Tunnel) tunReader() {
 							// sendPacketWithRouting handled release if queued; nothing to release here
 						}
 					} else {
-						if !enqueueWithPolicy(t.sendQueue, frag, t.stopCh, t.fecEnabled) {
+						if !enqueueWithPolicy(t.sendQueue, fragCopy, t.stopCh, t.fecEnabled) {
 							select {
 							case <-t.stopCh:
 								return
@@ -1527,20 +1529,22 @@ func (t *Tunnel) tunReaderServer() {
 			atomic.AddUint64(&t.statFragmentsGenerated, uint64(len(fragments)))
 
 			for _, frag := range fragments {
-				if frag[0]>>4 != IPv4Version {
+				fragCopy := make([]byte, len(frag))
+				copy(fragCopy, frag)
+				if fragCopy[0]>>4 != IPv4Version {
 					continue
 				}
-				dstIP := net.IP(frag[IPv4DstIPOffset : IPv4DstIPOffset+4])
+				dstIP := net.IP(fragCopy[IPv4DstIPOffset : IPv4DstIPOffset+4])
 				client := t.getClientByIP(dstIP)
 				if client != nil {
-					queued := enqueueWithClientPolicy(client.sendQueue, frag, t.stopCh, client.stopCh, t.fecEnabled)
+					queued := enqueueWithClientPolicy(client.sendQueue, fragCopy, t.stopCh, client.stopCh, t.fecEnabled)
 					if !queued {
 						log.Printf("⚠️  Client send queue full for %s after timeout, dropping fragment", dstIP)
 					}
 					continue
 				}
 				if routeClient := t.findRouteClient(dstIP); routeClient != nil {
-					queued := enqueueWithClientPolicy(routeClient.sendQueue, frag, t.stopCh, routeClient.stopCh, t.fecEnabled)
+					queued := enqueueWithClientPolicy(routeClient.sendQueue, fragCopy, t.stopCh, routeClient.stopCh, t.fecEnabled)
 					if !queued {
 						log.Printf("⚠️  Route client queue full for %s after timeout, dropping fragment", dstIP)
 					}
