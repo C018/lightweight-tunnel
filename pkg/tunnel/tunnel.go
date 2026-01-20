@@ -883,16 +883,24 @@ func (t *Tunnel) Start() error {
 
 		// Start client mode packet processing
 		if netReaderStarted {
-			t.wg.Add(3)
+			t.wg.Add(3 + t.config.SendWorkers - 1) // +1 main netWriter + (N-1) extra workers
 			go t.tunReader()
 			go t.tunWriter()
-			go t.netWriter()
+			
+			// Start multiple netWriter workers
+			for i := 0; i < t.config.SendWorkers; i++ {
+				go t.netWriter()
+			}
 		} else {
-			t.wg.Add(4)
+			t.wg.Add(4 + t.config.SendWorkers - 1)
 			go t.tunReader()
 			go t.tunWriter()
 			go t.netReader()
-			go t.netWriter()
+			
+			// Start multiple netWriter workers
+			for i := 0; i < t.config.SendWorkers; i++ {
+				go t.netWriter()
+			}
 		}
 
 		// Start keepalive

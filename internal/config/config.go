@@ -53,43 +53,47 @@ type Config struct {
 	// Fake TCP pacing configuration
 	FakeTCPWritePacingUs int `json:"faketcp_pacing_us"` // Minimum delay between fake TCP segments (microseconds, 0=auto/off)
 	FakeTCPMaxSegment    int `json:"faketcp_max_segment"` // Max payload bytes per fake TCP segment (0=auto)
+
+	// Performance tuning
+	SendWorkers int `json:"send_workers"` // Number of parallel send workers (default 4)
 }
 
 // DefaultConfig returns a default configuration
 func DefaultConfig() *Config {
 	return &Config{
-		Mode:                "server",
-		Transport:           "rawtcp", // Fixed to rawtcp for true TCP disguise
-		LocalAddr:           "0.0.0.0:9000",
-		RemoteAddr:          "",
-		TunnelAddr:          "10.0.0.1/24",
-		MTU:                 1400,
-		FECDataShards:       10,
-		FECParityShards:     2,
-		Timeout:             30,
-		KeepaliveInterval:   5, // Reduced from 10 to 5 seconds for faster detection of connection issues
-		SendQueueSize:       1000, // Balanced for latency and throughput (reduced from 10000 to avoid bufferbloat)
-		RecvQueueSize:       1000, // Balanced for latency and throughput (reduced from 10000 to avoid bufferbloat)
-		TunName:             "",
-		Routes:              []string{},
-		ConfigPushInterval:  0,
-		MultiClient:         true,
-		MaxClients:          100,
-		ClientIsolation:     false,
-		P2PEnabled:          true,
-		P2PPort:             0, // Auto-select
-		EnableMeshRouting:   true,
-		MaxHops:             3,
-		RouteUpdateInterval: 30,
+		Mode:                 "server",
+		Transport:            "rawtcp", // Fixed to rawtcp for true TCP disguise
+		LocalAddr:            "0.0.0.0:9000",
+		RemoteAddr:           "",
+		TunnelAddr:           "10.0.0.1/24",
+		MTU:                  1400,
+		FECDataShards:        10,
+		FECParityShards:      2,
+		Timeout:              30,
+		KeepaliveInterval:    5,    // Reduced from 10 to 5 seconds for faster detection of connection issues
+		SendQueueSize:        1000, // Balanced for latency and throughput (reduced from 10000 to avoid bufferbloat)
+		RecvQueueSize:        1000, // Balanced for latency and throughput (reduced from 10000 to avoid bufferbloat)
+		TunName:              "",
+		Routes:               []string{},
+		ConfigPushInterval:   0,
+		MultiClient:          true,
+		MaxClients:           100,
+		ClientIsolation:      false,
+		P2PEnabled:           true,
+		P2PPort:              0, // Auto-select
+		EnableMeshRouting:    true,
+		MaxHops:              3,
+		RouteUpdateInterval:  30,
 		P2PTimeout:           5,
 		EnableNATDetection:   true,
 		EnableXDP:            true,
 		EnableKernelTune:     true,
 		RouteAdvertInterval:  300, // 5 minutes
 		P2PKeepAliveInterval: 25,  // 25 seconds
-		EncryptAfterAuth:     false, // Default to per-packet encryption for security
+		EncryptAfterAuth:     false,
 		FakeTCPWritePacingUs: 0,
 		FakeTCPMaxSegment:    0,
+		SendWorkers:          4, // Default to 4 workers for high throughput
 	}
 }
 
