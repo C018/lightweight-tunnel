@@ -2872,6 +2872,11 @@ func (t *Tunnel) sendPacketWithRouting(packet []byte) (bool, error) {
 		return t.sendViaServer(packet)
 	}
 
+	// When FEC is enabled, force traffic through the server to ensure FEC protection.
+	if t.fecEnabled {
+		return t.sendViaServer(packet)
+	}
+
 	// On-demand P2P: Check if we have a P2P connection
 	if t.p2pManager != nil && t.p2pManager.IsConnected(dstIP) {
 		// Direct P2P connection exists, use it
@@ -4058,6 +4063,7 @@ func (t *Tunnel) processFECShard(peerAddr string, fecPacket []byte) ([][]byte, e
 
 	// Validate shard consistency
 	if session.dataShards != dataShards || session.parityShards != parityShards || session.expectedShardSize != shardSize {
+		delete(t.fecRecvSessions, sessionKey)
 		t.fecRecvMux.Unlock()
 		return nil, fmt.Errorf("FEC session %s: shard metadata mismatch", sessionKey)
 	}
