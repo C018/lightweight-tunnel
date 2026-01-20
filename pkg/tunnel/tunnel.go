@@ -290,6 +290,16 @@ type Tunnel struct {
 	authenticated    bool              // Whether client is authenticated (client mode)
 	authMux          sync.Mutex        // Protects authenticated flag
 	authResponseChan chan error        // Channel for receiving auth response (client mode)
+
+	// Work queue for parallel FEC processing
+	fecWorkQueue chan *fecBatchWork
+}
+
+// fecBatchWork represents a batch of packets to be processed by workers
+type fecBatchWork struct {
+	sessionID    uint32
+	packets      [][]byte
+	parityShards int
 }
 
 // prependPacketType adds a leading packet type byte to the payload.
@@ -740,6 +750,7 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 		fecRecvSessions:    make(map[string]*fecRecvSession),
 		fecSessionID:       uint32(time.Now().UnixNano()),
 		fecReorderBufs:     make(map[string]*fecReorderBuffer),
+		fecWorkQueue:       make(chan *fecBatchWork, cfg.SendQueueSize), // Reuse send queue size for work queue
 	}
 	t.packetPool = &sync.Pool{
 		New: func() any {
@@ -883,23 +894,25 @@ func (t *Tunnel) Start() error {
 
 		// Start client mode packet processing
 		if netReaderStarted {
-			t.wg.Add(3 + t.config.SendWorkers - 1) // +1 main netWriter + (N-1) extra workers
+			t.wg.Add(3 + t.config.SendWorkers) // +1 main netWriter + N workers
 			go t.tunReader()
 			go t.tunWriter()
+			go t.netWriter() // Reverted to single netWriter (dispatcher)
 			
-			// Start multiple netWriter workers
+			// Start multiple FEC processing workers
 			for i := 0; i < t.config.SendWorkers; i++ {
-				go t.netWriter()
+				go t.fecWorker()
 			}
 		} else {
-			t.wg.Add(4 + t.config.SendWorkers - 1)
+			t.wg.Add(4 + t.config.SendWorkers)
 			go t.tunReader()
 			go t.tunWriter()
 			go t.netReader()
+			go t.netWriter() // Reverted to single netWriter (dispatcher)
 			
-			// Start multiple netWriter workers
+			// Start multiple FEC processing workers
 			for i := 0; i < t.config.SendWorkers; i++ {
-				go t.netWriter()
+				go t.fecWorker()
 			}
 		}
 
@@ -2119,49 +2132,31 @@ func (t *Tunnel) netWriter() {
 		if len(batch) == 0 {
 			return
 		}
-		defer func() {
-			for _, pkt := range batch {
+		
+		// Dispatch batch to workers
+		// Create a copy of the batch to decouple from the loop's slice
+		workBatch := make([][]byte, len(batch))
+		copy(workBatch, batch)
+		
+		work := &fecBatchWork{
+			sessionID:    t.nextFECSessionID(),
+			packets:      workBatch,
+			parityShards: parityShards,
+		}
+		
+		select {
+		case t.fecWorkQueue <- work:
+			// Dispatched
+		case <-t.stopCh:
+			// Tunnel stopping
+			for _, pkt := range workBatch {
 				t.releasePacketBuffer(pkt)
 			}
-			batch = batch[:0]
-		}()
-
-		// Ensure connection
-		if t.conn == nil {
-			if err := t.reconnectToServer(); err != nil {
-				return
-			}
+			return
 		}
 
-		sendErr := t.sendBatchWithFEC(t.conn, batch, parityShards, t.encryptPacket)
-		if sendErr != nil {
-			select {
-			case <-t.stopCh:
-				return
-			default:
-				log.Printf("Network write error: %v, attempting reconnection...", sendErr)
-			}
-
-			t.connMux.Lock()
-			if t.conn != nil {
-				_ = t.conn.Close()
-				t.conn = nil
-			}
-			t.connMux.Unlock()
-
-			if err := t.reconnectToServer(); err != nil {
-				return
-			}
-			log.Printf("Reconnection successful, retrying batch send")
-			t.reannounceP2PInfoAfterReconnect()
-
-			if t.conn != nil {
-				retryErr := t.sendBatchWithFEC(t.conn, batch, parityShards, t.encryptPacket)
-				if retryErr != nil {
-					log.Printf("Network write retry failed: %v, batch will be lost", retryErr)
-				}
-			}
-		}
+		// Clear local batch for new data (reuse capacity)
+		batch = batch[:0]
 	}
 
 	for {
@@ -4286,6 +4281,114 @@ func (t *Tunnel) sendPeerInfoAndPunch(client *ClientConnection, peerInfo string)
 
 // sendBatchWithFEC encodes multiple packets using FEC and sends all shards.
 // parityShards specifies the number of parity shards for this batch.
+// fecWorker processes batches from the work queue
+func (t *Tunnel) fecWorker() {
+	defer t.wg.Done()
+	
+	for {
+		select {
+		case <-t.stopCh:
+			return
+		case work := <-t.fecWorkQueue:
+			func() {
+				// Release packets after processing
+				defer func() {
+					for _, pkt := range work.packets {
+						t.releasePacketBuffer(pkt)
+					}
+				}()
+
+				// Ensure connection
+				if t.conn == nil {
+					if err := t.reconnectToServer(); err != nil {
+						return
+					}
+				}
+				
+				conn := t.conn
+				if conn == nil {
+					return 
+				}
+
+				// Encrypt
+				encPackets := make([][]byte, len(work.packets))
+				for i, pkt := range work.packets {
+					fullPacket, _ := prependPacketType(pkt, PacketTypeData)
+					if t.cipher != nil {
+						enc, err := t.encryptPacket(fullPacket)
+						if err != nil {
+							log.Printf("Encryption error in worker: %v", err)
+							return
+						}
+						encPackets[i] = enc
+					} else {
+						encPackets[i] = fullPacket
+					}
+				}
+
+				// FEC Encoding
+				dataShards := t.config.FECDataShards
+				if len(encPackets) < dataShards {
+					for i := 0; i < dataShards-len(encPackets); i++ {
+						encPackets = append(encPackets, make([]byte, 1))
+					}
+				}
+
+				maxLen := 0
+				for _, enc := range encPackets {
+					if len(enc) > maxLen {
+						maxLen = len(enc)
+					}
+				}
+
+				shardSize := maxLen + 2
+				shards := make([][]byte, dataShards+work.parityShards)
+				for i := 0; i < dataShards; i++ {
+					shards[i] = make([]byte, shardSize)
+					binary.BigEndian.PutUint16(shards[i][0:2], uint16(len(encPackets[i])))
+					copy(shards[i][2:], encPackets[i])
+				}
+				for i := dataShards; i < dataShards+work.parityShards; i++ {
+					shards[i] = make([]byte, shardSize)
+				}
+
+				if err := t.fec.EncodeShards(shards, dataShards, work.parityShards); err != nil {
+					log.Printf("FEC encode error: %v", err)
+					return
+				}
+
+				// Send
+				sessionID := work.sessionID
+				for i, shard := range shards {
+					fecPacket := make([]byte, 1+4+2+2+2+2+len(shard))
+					fecPacket[0] = PacketTypeFECShard
+					fecPacket[1] = byte(sessionID >> 24)
+					fecPacket[2] = byte(sessionID >> 16)
+					fecPacket[3] = byte(sessionID >> 8)
+					fecPacket[4] = byte(sessionID)
+					fecPacket[5] = byte(i >> 8)
+					fecPacket[6] = byte(i)
+					fecPacket[7] = byte(dataShards >> 8)
+					fecPacket[8] = byte(dataShards)
+					fecPacket[9] = byte(work.parityShards >> 8)
+					fecPacket[10] = byte(work.parityShards)
+					fecPacket[11] = byte(shardSize >> 8)
+					fecPacket[12] = byte(shardSize)
+					copy(fecPacket[13:], shard)
+
+					if err := conn.WritePacket(fecPacket); err != nil {
+						// log only verbose
+					}
+				}
+
+				if pacing := faketcp.GetTuning().WritePacingMinDelay; pacing > 0 {
+					time.Sleep(pacing)
+				}
+			}()
+		}
+	}
+}
+
 func (t *Tunnel) sendBatchWithFEC(conn faketcp.ConnAdapter, packets [][]byte, parityShards int, encryptFn func([]byte) ([]byte, error)) error {
 	if !t.fecEnabled || t.fec == nil {
 		return errors.New("FEC not enabled")
