@@ -175,6 +175,7 @@ type fecReorderBuffer struct {
 	next       uint32
 	pending    map[uint32][][]byte
 	lastUpdate time.Time
+	gapSince   time.Time
 }
 
 // ConfigUpdateMessage carries server-pushed configuration updates.
@@ -450,22 +451,30 @@ func (t *Tunnel) handleRecoveredBatch(peerAddr string, sessionID uint32, packets
 		buf.next++
 		toDeliver = append(toDeliver, pkts...)
 	}
-
-	if len(toDeliver) == 0 && len(buf.pending) > 0 && time.Since(buf.lastUpdate) > reorderTimeout {
-		// Resync to the smallest available session ID
-		var min uint32
-		first := true
-		for sid := range buf.pending {
-			if first || sid < min {
-				min = sid
-				first = false
-			}
+	if len(toDeliver) > 0 {
+		buf.gapSince = time.Time{}
+	}
+	if len(toDeliver) == 0 && len(buf.pending) > 0 {
+		if buf.gapSince.IsZero() {
+			buf.gapSince = time.Now()
 		}
-		buf.next = min
-		if pkts, ok := buf.pending[buf.next]; ok {
-			delete(buf.pending, buf.next)
-			buf.next++
-			toDeliver = append(toDeliver, pkts...)
+		if time.Since(buf.gapSince) > reorderTimeout {
+			// Resync to the smallest available session ID
+			var min uint32
+			first := true
+			for sid := range buf.pending {
+				if first || sid < min {
+					min = sid
+					first = false
+				}
+			}
+			buf.next = min
+			buf.gapSince = time.Time{}
+			if pkts, ok := buf.pending[buf.next]; ok {
+				delete(buf.pending, buf.next)
+				buf.next++
+				toDeliver = append(toDeliver, pkts...)
+			}
 		}
 	}
 
