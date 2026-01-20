@@ -4687,23 +4687,6 @@ func (t *Tunnel) processFECShard(peerAddr string, fecPacket []byte) (uint32, [][
 
 	return sessionID, nil, nil
 }
-			packet := make([]byte, pktLen)
-			copy(packet, shard[2:2+pktLen])
-			packets = append(packets, packet)
-		}
-
-		// Clean up session
-		t.fecRecvMux.Lock()
-		delete(t.fecRecvSessions, sessionKey)
-		t.fecRecvMux.Unlock()
-
-		atomic.AddUint64(&t.statFECSessionsRecovered, 1)
-		atomic.AddUint64(&t.statFECPacketsRecovered, uint64(len(packets)))
-		return sessionID, packets, nil
-	}
-
-	return sessionID, nil, nil
-}
 
 // cleanupStaleFECSessions removes old FEC sessions that haven't been updated
 func (t *Tunnel) cleanupStaleFECSessions() {
