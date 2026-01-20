@@ -734,6 +734,12 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 		log.Println("XDP fast path disabled, using regular path")
 	}
 
+	// Ensure at least one worker is running even if config is missing or 0
+	if cfg.SendWorkers <= 0 {
+		cfg.SendWorkers = 4
+		log.Printf("⚠️  SendWorkers not configured or invalid, defaulting to %d", cfg.SendWorkers)
+	}
+
 	t := &Tunnel{
 		config:             cfg,
 		configFilePath:     configFilePath,
