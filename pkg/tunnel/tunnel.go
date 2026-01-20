@@ -4449,6 +4449,7 @@ func (t *Tunnel) fecIngressWorker() {
 						// Server mode: Client specific logic
 						decryptedPacket, usedCipher, gen, err := t.decryptPacketFromClient(work.client, reconstructedPacket)
 						if err != nil {
+							log.Printf("Worker: Decrypt failed for %s: %v", work.remoteAddr, err)
 							return
 						}
 						
@@ -4456,7 +4457,9 @@ func (t *Tunnel) fecIngressWorker() {
 							work.client.setCipherWithGen(usedCipher, gen)
 						}
 						
-						t.handleClientPacket(work.client, decryptedPacket)
+						if !t.handleClientPacket(work.client, decryptedPacket) {
+							// log.Printf("Worker: handleClientPacket returned false for %s", work.remoteAddr)
+						}
 					} else {
 						// Client mode: Tunnel logic
 						// Send to decryption queue
