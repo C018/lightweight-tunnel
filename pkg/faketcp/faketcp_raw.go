@@ -361,6 +361,9 @@ func (c *ConnRaw) WritePacket(data []byte) error {
 		}
 
 		c.seqNum += uint32(len(segment))
+		if tunables.WritePacingMinDelay > 0 {
+			time.Sleep(tunables.WritePacingMinDelay)
+		}
 	}
 
 	return nil
