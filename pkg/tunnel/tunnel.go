@@ -76,13 +76,22 @@ const (
 	packetBufferSlack = 128 // Extra bytes to leave headroom for prepending headers without reallocations
 )
 
-// enqueueWithTimeout attempts to enqueue a packet, waiting briefly for capacity.
-// Returns true when the packet was queued, or false when stopCh is closed or the timeout elapses.
-func enqueueWithTimeout(queue chan []byte, packet []byte, stopCh <-chan struct{}) bool {
+// enqueueWithPolicy enqueues a packet with optional blocking behavior.
+// When block is true, it will wait indefinitely until queued or stopCh closes.
+// When block is false, it will wait up to QueueSendTimeout.
+func enqueueWithPolicy(queue chan []byte, packet []byte, stopCh <-chan struct{}, block bool) bool {
 	select {
 	case queue <- packet:
 		return true
 	default:
+		if block {
+			select {
+			case queue <- packet:
+				return true
+			case <-stopCh:
+				return false
+			}
+		}
 	}
 
 	timer := time.NewTimer(QueueSendTimeout)
@@ -92,6 +101,39 @@ func enqueueWithTimeout(queue chan []byte, packet []byte, stopCh <-chan struct{}
 	case queue <- packet:
 		return true
 	case <-stopCh:
+		return false
+	case <-timer.C:
+		return false
+	}
+}
+
+// enqueueWithClientPolicy enqueues a packet with optional blocking behavior and client stop handling.
+func enqueueWithClientPolicy(queue chan []byte, packet []byte, stopCh, clientStopCh <-chan struct{}, block bool) bool {
+	select {
+	case queue <- packet:
+		return true
+	default:
+		if block {
+			select {
+			case queue <- packet:
+				return true
+			case <-stopCh:
+				return false
+			case <-clientStopCh:
+				return false
+			}
+		}
+	}
+
+	timer := time.NewTimer(QueueSendTimeout)
+	defer timer.Stop()
+
+	select {
+	case queue <- packet:
+		return true
+	case <-stopCh:
+		return false
+	case <-clientStopCh:
 		return false
 	case <-timer.C:
 		return false
@@ -1209,7 +1251,7 @@ func (t *Tunnel) tunReader() {
 				}
 			} else {
 				// Default: queue for server
-				if !enqueueWithTimeout(t.sendQueue, packet, t.stopCh) {
+				if !enqueueWithPolicy(t.sendQueue, packet, t.stopCh, t.fecEnabled) {
 					t.releasePacketBuffer(buf)
 					select {
 					case <-t.stopCh:
@@ -1304,41 +1346,18 @@ func (t *Tunnel) tunReaderServer() {
 		// Find the client with this destination IP
 		client := t.getClientByIP(dstIP)
 		if client != nil {
-			select {
-			case client.sendQueue <- packet:
-			case <-t.stopCh:
+			queued := enqueueWithClientPolicy(client.sendQueue, packet, t.stopCh, client.stopCh, t.fecEnabled)
+			if !queued {
+				log.Printf("⚠️  Client send queue full for %s after timeout, dropping packet", dstIP)
 				t.releasePacketBuffer(buf)
-				return
-			case <-time.After(QueueSendTimeout):
-				// Wait for queue space before logging and dropping
-				select {
-				case client.sendQueue <- packet:
-				case <-t.stopCh:
-					t.releasePacketBuffer(buf)
-					return
-				default:
-					log.Printf("⚠️  Client send queue full for %s after timeout, dropping packet", dstIP)
-					t.releasePacketBuffer(buf)
-				}
 			}
 		} else {
 			// Try advertised routes
 			if routeClient := t.findRouteClient(dstIP); routeClient != nil {
-				select {
-				case routeClient.sendQueue <- packet:
-				case <-t.stopCh:
+				queued := enqueueWithClientPolicy(routeClient.sendQueue, packet, t.stopCh, routeClient.stopCh, t.fecEnabled)
+				if !queued {
+					log.Printf("⚠️  Route client queue full for %s after timeout, dropping packet", dstIP)
 					t.releasePacketBuffer(buf)
-					return
-				case <-time.After(QueueSendTimeout):
-					select {
-					case routeClient.sendQueue <- packet:
-					case <-t.stopCh:
-						t.releasePacketBuffer(buf)
-						return
-					default:
-						log.Printf("⚠️  Route client queue full for %s after timeout, dropping packet", dstIP)
-						t.releasePacketBuffer(buf)
-					}
 				}
 			} else {
 				t.releasePacketBuffer(buf)
@@ -1529,7 +1548,7 @@ func (t *Tunnel) netReader() {
 					payload := decryptedPacket[1:]
 
 					if packetType == PacketTypeData {
-						if !enqueueWithTimeout(t.recvQueue, payload, t.stopCh) {
+						if !enqueueWithPolicy(t.recvQueue, payload, t.stopCh, t.fecEnabled) {
 							select {
 							case <-t.stopCh:
 								return
@@ -1561,7 +1580,7 @@ func (t *Tunnel) netReader() {
 		switch packetType {
 		case PacketTypeData:
 			// Queue for TUN device
-			if !enqueueWithTimeout(t.recvQueue, payload, t.stopCh) {
+			if !enqueueWithPolicy(t.recvQueue, payload, t.stopCh, t.fecEnabled) {
 				select {
 				case <-t.stopCh:
 					return
@@ -2032,32 +2051,9 @@ func (t *Tunnel) handleClientPacket(client *ClientConnection, packet []byte) boo
 					forwardPacket := forwardBuf[:len(payload)]
 					copy(forwardPacket, payload)
 
-					queued := false
-					select {
-					case targetClient.sendQueue <- forwardPacket:
-						queued = true
-					case <-t.stopCh:
-						t.releasePacketBuffer(forwardBuf)
-						return false
-					case <-client.stopCh:
-						t.releasePacketBuffer(forwardBuf)
-						return false
-					case <-time.After(QueueSendTimeout):
-						select {
-						case targetClient.sendQueue <- forwardPacket:
-							queued = true
-						case <-t.stopCh:
-							t.releasePacketBuffer(forwardBuf)
-							return false
-						case <-client.stopCh:
-							t.releasePacketBuffer(forwardBuf)
-							return false
-						default:
-							log.Printf("⚠️  Target client send queue full for %s after timeout, dropping packet", dstIP)
-							t.releasePacketBuffer(forwardBuf)
-						}
-					}
+					queued := enqueueWithClientPolicy(targetClient.sendQueue, forwardPacket, t.stopCh, client.stopCh, t.fecEnabled)
 					if !queued {
+						log.Printf("⚠️  Target client send queue full for %s after timeout, dropping packet", dstIP)
 						t.releasePacketBuffer(forwardBuf)
 					}
 				} else {
@@ -2988,23 +2984,10 @@ func (t *Tunnel) requestP2PConnection(targetIP net.IP) {
 // sendViaServer sends packet through the server connection
 // Uses timeout-based approach to handle queue congestion
 func (t *Tunnel) sendViaServer(packet []byte) (bool, error) {
-	select {
-	case t.sendQueue <- packet:
+	if enqueueWithPolicy(t.sendQueue, packet, t.stopCh, t.fecEnabled) {
 		return true, nil
-	case <-t.stopCh:
-		return false, errors.New("tunnel stopped")
-	case <-time.After(QueueSendTimeout):
-		// Wait for queue space before giving up
-		// This handles temporary bursts without immediately dropping packets
-		select {
-		case t.sendQueue <- packet:
-			return true, nil
-		case <-t.stopCh:
-			return false, errors.New("tunnel stopped")
-		default:
-			return false, errors.New("send queue full after timeout")
-		}
 	}
+	return false, errors.New("send queue full after timeout")
 }
 
 // markPeerFallbackToServer updates routing state to force server relay for a peer.
