@@ -305,7 +305,8 @@ type Tunnel struct {
 
 	// Work queue for parallel FEC Ingress/Reconstruction (Receive side)
 	// Decouples socket reading from heavy RS reconstruction math
-	fecIngressQueue chan *fecIngressWork
+	// Sharded by (SessionID % SendWorkers) to ensure session affinity and avoid lock contention
+	fecIngressQueues []chan *fecIngressWork
 }
 
 type fecIngressWork struct {
@@ -778,8 +779,14 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 		fecReorderBufs:     make(map[string]*fecReorderBuffer),
 		fecWorkQueue:       make(chan *fecBatchWork, cfg.SendQueueSize), // Reuse send queue size for work queue
 		fecDecryptionQueue: make(chan [][]byte, cfg.SendQueueSize*2),    // Queue for parallel decryption
-		fecIngressQueue:    make(chan *fecIngressWork, cfg.RecvQueueSize*2), // Critical fix: Initialize ingress queue
 	}
+
+	// Initialize sharded ingress queues
+	t.fecIngressQueues = make([]chan *fecIngressWork, cfg.SendWorkers)
+	for i := 0; i < cfg.SendWorkers; i++ {
+		t.fecIngressQueues[i] = make(chan *fecIngressWork, cfg.RecvQueueSize)
+	}
+
 	t.packetPool = &sync.Pool{
 		New: func() any {
 			return make([]byte, packetBufSize)
@@ -942,8 +949,9 @@ func (t *Tunnel) Start() error {
 			
 			// Parallelize FEC Ingress workers (Reconstruction)
 			// This is CRITICAL: Moves math out of the socket read loop
+			// We use sharded queues to maintain session affinity
 			for i := 0; i < t.config.SendWorkers; i++ {
-				go t.fecIngressWorker()
+				go t.fecIngressWorker(t.fecIngressQueues[i]) // Pass the specific queue
 			}
 
 			go t.netWriter() 
@@ -969,7 +977,7 @@ func (t *Tunnel) Start() error {
 			
 			// Parallelize FEC Ingress workers
 			for i := 0; i < t.config.SendWorkers; i++ {
-				go t.fecIngressWorker()
+				go t.fecIngressWorker(t.fecIngressQueues[i]) // Pass the specific queue
 			}
 
 			go t.netReader()
@@ -1467,7 +1475,7 @@ func (t *Tunnel) startServer() error {
 	// These handle high-speed FEC reconstruction for ALL clients
 	for i := 0; i < t.config.SendWorkers; i++ {
 		t.wg.Add(1)
-		go t.fecIngressWorker()
+		go t.fecIngressWorker(t.fecIngressQueues[i]) // Pass the specific queue
 	}
 
 	if t.config.MultiClient {
@@ -1961,8 +1969,22 @@ func (t *Tunnel) netReader() {
 		if len(packet) > 0 && packet[0] == PacketTypeFECShard {
 			if t.fecEnabled {
 				// Offload to worker pool
+				// Dispatch based on SessionID to ensure affinity
+				// Packet: [Type(1)][SessionID(4)][...]
+				var targetQueue chan *fecIngressWork
+				
+				if len(packet) >= 5 {
+					// Use SessionID for affinity
+					sessionID := uint32(packet[1])<<24 | uint32(packet[2])<<16 | uint32(packet[3])<<8 | uint32(packet[4])
+					workerID := sessionID % uint32(t.config.SendWorkers)
+					targetQueue = t.fecIngressQueues[workerID]
+				} else {
+					// Too short to be valid, but if we must dispatch, pick 0
+					targetQueue = t.fecIngressQueues[0]
+				}
+
 				select {
-				case t.fecIngressQueue <- &fecIngressWork{
+				case targetQueue <- &fecIngressWork{
 					remoteAddr: t.config.RemoteAddr,
 					packet:     packet[1:],
 				}:
@@ -2358,10 +2380,23 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 		if len(packet) > 0 && packet[0] == PacketTypeFECShard {
 			if t.fecEnabled {
 				// Offload to worker pool - do NOT process in this hot loop
+				// Dispatch based on SessionID to ensure affinity
+				// Packet: [Type(1)][SessionID(4)][...]
+				var targetQueue chan *fecIngressWork
+				
+				if len(packet) >= 5 {
+					// Use SessionID for affinity
+					sessionID := uint32(packet[1])<<24 | uint32(packet[2])<<16 | uint32(packet[3])<<8 | uint32(packet[4])
+					workerID := sessionID % uint32(t.config.SendWorkers)
+					targetQueue = t.fecIngressQueues[workerID]
+				} else {
+					targetQueue = t.fecIngressQueues[0]
+				}
+
 				// Copy packet to decouple from read buffer if needed (or assume ownership)
 				// Here packet is already a copy from ReadPacket, so passing it is safe.
 				select {
-				case t.fecIngressQueue <- &fecIngressWork{
+				case targetQueue <- &fecIngressWork{
 					remoteAddr: client.conn.RemoteAddr().String(),
 					packet:     packet[1:], // Strip type header
 					client:     client,
@@ -4436,15 +4471,16 @@ func (t *Tunnel) fecWorker() {
 }
 
 // fecIngressWorker processes incoming FEC shards (Reconstruction)
-// This runs in a pool to keep the main read loop fast
-func (t *Tunnel) fecIngressWorker() {
+// This runs in a pool to keep the main read loop fast.
+// Each worker reads from its own queue to ensure session affinity (processFECShard concurrency safety)
+func (t *Tunnel) fecIngressWorker(queue chan *fecIngressWork) {
 	defer t.wg.Done()
 	
 	for {
 		select {
 		case <-t.stopCh:
 			return
-		case work := <-t.fecIngressQueue:
+		case work := <-queue:
 			sessionID, reconstructedPackets, err := t.processFECShard(work.remoteAddr, work.packet)
 			if err != nil {
 				continue
@@ -4457,7 +4493,7 @@ func (t *Tunnel) fecIngressWorker() {
 						// Server mode: Client specific logic
 						decryptedPacket, usedCipher, gen, err := t.decryptPacketFromClient(work.client, reconstructedPacket)
 						if err != nil {
-							log.Printf("Worker: Decrypt failed for %s: %v", work.remoteAddr, err)
+							// log.Printf("Worker: Decrypt failed for %s: %v", work.remoteAddr, err)
 							return
 						}
 						
