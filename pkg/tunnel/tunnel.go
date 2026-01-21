@@ -471,9 +471,9 @@ func (t *Tunnel) handleRecoveredBatch(peerAddr string, sessionID uint32, packets
 	if len(packets) == 0 {
 		return
 	}
-	// Reduced timeout to 50ms to minimize TCP stall duration on loss while allowing some reordering
-	const reorderTimeout = 50 * time.Millisecond
-	const reorderWindowSize = 128 // Increased window size to tolerate more reordering
+	// Increased timeout to 200ms to handle high variance in worker completion time without breaking TCP streams
+	const reorderTimeout = 200 * time.Millisecond
+	const reorderWindowSize = 1024 // Increased window size significantly to handle high throughput queues
 
 	t.fecReorderMux.Lock()
 	buf := t.fecReorderBufs[peerAddr]
