@@ -4753,29 +4753,14 @@ func (t *Tunnel) processFECShard(peerAddr string, fecPacket []byte) (uint32, [][
 		
 		// Mark session as complete so we don't process it again?
 		// Actually best to remove it from map to save memory.
-		// But we need to unlock session.mu before locking global t.fecRecvMux to avoid deadlock risk if cleanup is running?
-		// Actually, standard practice: Map Lock -> ... -> delete.
-		// Here we hold session.mu.
-		
-		// To safely delete:
-		// 1. Release session lock
-		// 2. Acquire Map lock
-		// 3. Delete
-		// But defer session.mu.Unlock() will run at end.
-		
-		// Strategy: Just let the cleanup timer remove it OR handle it asynchronously?
-		// Optimized: If we successfully reconstructed, we can mark it "done" in session struct
-		// and let cleanup remove it? Or leave it to handle dupes?
-		// If we return packets, caller will process them. If we return them AGAIN for same session (duplicate batch),
-		// we get replay.
-		// So we SHOULD remove it.
-
-		// We will launch a goroutine to remove it to avoid lock inversion/complexity
-		go func(key string) {
-			t.fecRecvMux.Lock()
-			delete(t.fecRecvSessions, key)
-			t.fecRecvMux.Unlock()
-		}(sessionKey)
+		// Optimized: We rely on the periodic cleanupStaleFECSessions to remove old sessions.
+		// This avoids spawning a goroutine per batch and reducing lock contention on fecRecvMux.
+		// Since we already reconstructed, we won't need this session again (unless replayed, which is fine to ignore/reprocess idempontently).
+		// go func(key string) {
+		// 	t.fecRecvMux.Lock()
+		// 	delete(t.fecRecvSessions, key)
+		// 	t.fecRecvMux.Unlock()
+		// }(sessionKey)
 
 		return sessionID, packets, nil
 	}
