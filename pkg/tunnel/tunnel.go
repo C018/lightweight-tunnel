@@ -1512,7 +1512,7 @@ func (t *Tunnel) tunReader() {
 							// sendPacketWithRouting handled release if queued; nothing to release here
 						}
 					} else {
-						// CRITICAL FIX: Never block on send queue in client mode
+						// CRITICAL FIX: Never block on send queue (affects both client and server TUN readers)
 						// Blocking can freeze the entire TUN reader loop
 						if !enqueueWithPolicy(t.sendQueue, fragCopy, t.stopCh, false) {
 							select {
@@ -1540,7 +1540,7 @@ func (t *Tunnel) tunReader() {
 				}
 			} else {
 				// Default: queue for server
-				// CRITICAL FIX: Never block on send queue in client mode
+				// CRITICAL FIX: Never block on send queue (affects TUN reader in both modes)
 				if !enqueueWithPolicy(t.sendQueue, packet, t.stopCh, false) {
 					atomic.AddUint64(&t.statQueueDropSend, 1)
 					t.releasePacketBuffer(buf)
@@ -1700,6 +1700,7 @@ func (t *Tunnel) tunReaderServer() {
 func (t *Tunnel) tunWriter() {
 	defer t.wg.Done()
 
+	consecutiveErrors := 0
 	for {
 		select {
 		case <-t.stopCh:
@@ -1715,13 +1716,30 @@ func (t *Tunnel) tunWriter() {
 				default:
 					// Log error but continue processing other packets
 					// Common transient errors: "no buffer space available", "network is down"
-					log.Printf("⚠️  TUN write error (continuing): %v", err)
-					// Small backoff to avoid spinning on persistent errors
-					time.Sleep(10 * time.Millisecond)
+					consecutiveErrors++
+					log.Printf("⚠️  TUN write error (count: %d, continuing): %v", consecutiveErrors, err)
+					// Exponential backoff to avoid spinning on persistent errors
+					// Start at 1ms, cap at 100ms
+					backoff := time.Duration(1<<min(consecutiveErrors-1, 6)) * time.Millisecond
+					if backoff > 100*time.Millisecond {
+						backoff = 100 * time.Millisecond
+					}
+					time.Sleep(backoff)
 				}
+			} else {
+				// Reset error counter on successful write
+				consecutiveErrors = 0
 			}
 		}
 	}
+}
+
+// min returns the smaller of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // netReader reads packets from network connection
