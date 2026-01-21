@@ -271,11 +271,7 @@ type Tunnel struct {
 	// FEC state tracking
 	fecEnabled       bool
 	fecSessionID     uint32                      // Current FEC session ID for sending
-	fecRecvSessions  map[string]*fecRecvSession  // FEC receive sessions (key: "peerAddr:sessionID" -> session)
-	fecRecvMux       sync.Mutex                  // Protects fecRecvSessions
-	fecCleanupTicker *time.Ticker                // Ticker for cleaning up stale FEC sessions
-	fecReorderMux    sync.Mutex
-	fecReorderBufs   map[string]*fecReorderBuffer
+	// Note: fecRecvSessions and fecReorderBufs are now thread-local in each fecIngressWorker
 
 	// Stats counters (atomic)
 	statFECShardsRecv       uint64
@@ -467,125 +463,6 @@ func (t *Tunnel) logStatsLoop() {
 	}()
 }
 
-func (t *Tunnel) handleRecoveredBatch(peerAddr string, sessionID uint32, packets [][]byte, deliver func([]byte)) {
-	if len(packets) == 0 {
-		return
-	}
-	// Reordering timeout: trade-off between latency and dropped packets
-	// 20ms is aggressive enough to keep RTT low but allows small worker jitter
-	const reorderTimeout = 20 * time.Millisecond
-	const reorderWindowSize = 256 // Reduced slightly as strict worker affinity reduces massive reordering
-
-	t.fecReorderMux.Lock()
-	buf := t.fecReorderBufs[peerAddr]
-	if buf == nil {
-		buf = &fecReorderBuffer{
-			next:       sessionID,
-			pending:    make(map[uint32][][]byte),
-			lastUpdate: time.Now(),
-		}
-		t.fecReorderBufs[peerAddr] = buf
-	}
-
-	// Case 1: Late batch (already processed/skipped this sessionID)
-	// We drop TCP to preserve ordering, but always allow UDP to pass through to reduce latency/stall
-	if sessionID < buf.next {
-		atomic.AddUint64(&t.statFECLateBatchDrop, 1)
-		t.fecReorderMux.Unlock()
-		for _, pkt := range packets {
-			// Even if late, deliver it. The upper layer application (or kernel TCP stack)
-			// handles reordering better than we can guess.
-			// Especially because isUDPPacket() cannot inspect encrypted payloads accurately.
-			deliver(pkt)
-		}
-		return
-	}
-
-	// Case 2: Within window - Buffer it
-	windowEnd := buf.next + reorderWindowSize
-	if sessionID >= buf.next && sessionID < windowEnd {
-		buf.pending[sessionID] = packets
-		buf.lastUpdate = time.Now()
-	} else {
-		// Case 3: Beyond window - Force move window to catch up
-		// This happens if we fell way behind or the peer reset/jumped ahead
-		gapSize := sessionID - buf.next
-		atomic.AddUint64(&t.statFECGapSkip, uint64(gapSize))
-		buf.next = sessionID
-		buf.pending[sessionID] = packets
-		buf.lastUpdate = time.Now()
-		// Clear old pending entries that are now behind `buf.next`
-		for sid := range buf.pending {
-			if sid < buf.next {
-				delete(buf.pending, sid)
-			}
-		}
-	}
-
-	// Delivery Loop: STRICTLY SEQUENTIAL
-	// Only deliver packets that match buf.next
-	var toDeliver [][]byte
-	for {
-		if pkts, ok := buf.pending[buf.next]; ok {
-			toDeliver = append(toDeliver, pkts...)
-			delete(buf.pending, buf.next)
-			buf.next++
-			// We successfully advanced, so reset the gap timer
-			buf.gapSince = time.Time{}
-		} else {
-			// Gap detected! Stop delivery and wait for the missing batch or timeout.
-			break
-		}
-	}
-
-	// Timeout-based skipping logic
-	if len(buf.pending) > 0 {
-		// We have future packets buffered, but we are stuck at buf.next (gap)
-		if buf.gapSince.IsZero() {
-			buf.gapSince = time.Now()
-		} else if time.Since(buf.gapSince) > reorderTimeout {
-			// Timeout reached! Give up on waiting for buf.next
-			// Find the NEXT available session ID in our buffer
-			var minAvailable uint32
-			found := false
-			for sid := range buf.pending {
-				if sid > buf.next && (!found || sid < minAvailable) {
-					minAvailable = sid
-					found = true
-				}
-			}
-			if found {
-				// Skip the gap up to minAvailable
-				gap := minAvailable - buf.next
-				atomic.AddUint64(&t.statFECGapSkip, uint64(gap))
-				buf.next = minAvailable
-				buf.gapSince = time.Time{}
-
-				// Deliver the packet we just jumped to
-				if pkts, ok := buf.pending[buf.next]; ok {
-					toDeliver = append(toDeliver, pkts...)
-					delete(buf.pending, buf.next)
-					buf.next++
-				}
-			}
-		}
-	} else {
-		// No pending packets, so no gap to track
-		buf.gapSince = time.Time{}
-	}
-
-	// Cleanup old buffer if idle
-	if len(buf.pending) == 0 && time.Since(buf.lastUpdate) > 10*time.Second {
-		delete(t.fecReorderBufs, peerAddr)
-	}
-
-	t.fecReorderMux.Unlock()
-
-	for _, pkt := range toDeliver {
-		deliver(pkt)
-	}
-}
-
 // nextFECSessionID generates a unique FEC session ID in a thread-safe manner.
 func (t *Tunnel) nextFECSessionID() uint32 {
 	return atomic.AddUint32(&t.fecSessionID, 1)
@@ -775,9 +652,7 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 		xdpAccel:           accel,
 		pendingP2PRequests: make(map[string]time.Time),
 		fecEnabled:         cfg.FECDataShards > 0 && cfg.FECParityShards > 0,
-		fecRecvSessions:    make(map[string]*fecRecvSession),
 		fecSessionID:       uint32(time.Now().UnixNano()),
-		fecReorderBufs:     make(map[string]*fecReorderBuffer),
 		fecWorkQueue:       make(chan *fecBatchWork, cfg.SendQueueSize), // Reuse send queue size for work queue
 		fecDecryptionQueue: make(chan [][]byte, cfg.SendQueueSize*2),    // Queue for parallel decryption
 	}
@@ -883,10 +758,7 @@ func (t *Tunnel) Start() error {
 		return fmt.Errorf("failed to configure TUN: %v", err)
 	}
 
-	// Start FEC cleanup goroutine if FEC is enabled
-	if t.fecEnabled {
-		t.startFECCleanup()
-	}
+	// Note: FEC cleanup is now handled by each fecIngressWorker locally
 	// Start stats logger
 	t.logStatsLoop()
 
@@ -5030,40 +4902,4 @@ func (t *Tunnel) processFECShard(peerAddr string, fecPacket []byte) (uint32, [][
 }
 
 // cleanupStaleFECSessions removes old FEC sessions that haven't been updated
-func (t *Tunnel) cleanupStaleFECSessions() {
-	const sessionTimeout = 5 * time.Second
-	
-	t.fecRecvMux.Lock()
-	defer t.fecRecvMux.Unlock()
-	
-	now := time.Now()
-	for sessionKey, session := range t.fecRecvSessions {
-		if now.Sub(session.lastUpdate) > sessionTimeout {
-			delete(t.fecRecvSessions, sessionKey)
-		}
-	}
-}
 
-// startFECCleanup starts a periodic cleanup of stale FEC sessions
-func (t *Tunnel) startFECCleanup() {
-	if !t.fecEnabled {
-		return
-	}
-	
-	t.wg.Add(1)
-	go func() {
-		defer t.wg.Done()
-		
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		
-		for {
-			select {
-			case <-t.stopCh:
-				return
-			case <-ticker.C:
-				t.cleanupStaleFECSessions()
-			}
-		}
-	}()
-}
