@@ -1512,7 +1512,9 @@ func (t *Tunnel) tunReader() {
 							// sendPacketWithRouting handled release if queued; nothing to release here
 						}
 					} else {
-						if !enqueueWithPolicy(t.sendQueue, fragCopy, t.stopCh, t.fecEnabled) {
+						// CRITICAL FIX: Never block on send queue in client mode
+						// Blocking can freeze the entire TUN reader loop
+						if !enqueueWithPolicy(t.sendQueue, fragCopy, t.stopCh, false) {
 							select {
 							case <-t.stopCh:
 								return
@@ -1538,7 +1540,8 @@ func (t *Tunnel) tunReader() {
 				}
 			} else {
 				// Default: queue for server
-				if !enqueueWithPolicy(t.sendQueue, packet, t.stopCh, t.fecEnabled) {
+				// CRITICAL FIX: Never block on send queue in client mode
+				if !enqueueWithPolicy(t.sendQueue, packet, t.stopCh, false) {
 					atomic.AddUint64(&t.statQueueDropSend, 1)
 					t.releasePacketBuffer(buf)
 					select {
@@ -1607,14 +1610,16 @@ func (t *Tunnel) tunReaderServer() {
 				dstIP := net.IP(fragCopy[IPv4DstIPOffset : IPv4DstIPOffset+4])
 				client := t.getClientByIP(dstIP)
 				if client != nil {
-					queued := enqueueWithClientPolicy(client.sendQueue, fragCopy, t.stopCh, client.stopCh, t.fecEnabled)
+					// CRITICAL FIX: Never block indefinitely on fragment forwarding
+					queued := enqueueWithClientPolicy(client.sendQueue, fragCopy, t.stopCh, client.stopCh, false)
 					if !queued {
 						log.Printf("⚠️  Client send queue full for %s after timeout, dropping fragment", dstIP)
 					}
 					continue
 				}
 				if routeClient := t.findRouteClient(dstIP); routeClient != nil {
-					queued := enqueueWithClientPolicy(routeClient.sendQueue, fragCopy, t.stopCh, routeClient.stopCh, t.fecEnabled)
+					// CRITICAL FIX: Never block indefinitely on fragment forwarding
+					queued := enqueueWithClientPolicy(routeClient.sendQueue, fragCopy, t.stopCh, routeClient.stopCh, false)
 					if !queued {
 						log.Printf("⚠️  Route client queue full for %s after timeout, dropping fragment", dstIP)
 					}
@@ -1664,7 +1669,10 @@ func (t *Tunnel) tunReaderServer() {
 		// Find the client with this destination IP
 		client := t.getClientByIP(dstIP)
 		if client != nil {
-			queued := enqueueWithClientPolicy(client.sendQueue, packet, t.stopCh, client.stopCh, t.fecEnabled)
+			// CRITICAL FIX: Never block indefinitely on client send queue
+			// Using t.fecEnabled as block parameter caused entire TUN reader to hang
+			// when a single client's queue was full. Always use non-blocking mode.
+			queued := enqueueWithClientPolicy(client.sendQueue, packet, t.stopCh, client.stopCh, false)
 			if !queued {
 				atomic.AddUint64(&t.statQueueDropClientSend, 1)
 				log.Printf("⚠️  Client send queue full for %s after timeout, dropping packet", dstIP)
@@ -1673,7 +1681,8 @@ func (t *Tunnel) tunReaderServer() {
 		} else {
 			// Try advertised routes
 			if routeClient := t.findRouteClient(dstIP); routeClient != nil {
-				queued := enqueueWithClientPolicy(routeClient.sendQueue, packet, t.stopCh, routeClient.stopCh, t.fecEnabled)
+				// CRITICAL FIX: Never block indefinitely on route client queue
+				queued := enqueueWithClientPolicy(routeClient.sendQueue, packet, t.stopCh, routeClient.stopCh, false)
 				if !queued {
 					atomic.AddUint64(&t.statQueueDropRouteSend, 1)
 					log.Printf("⚠️  Route client queue full for %s after timeout, dropping packet", dstIP)
@@ -1696,14 +1705,20 @@ func (t *Tunnel) tunWriter() {
 		case <-t.stopCh:
 			return
 		case packet := <-t.recvQueue:
+			// CRITICAL FIX: Don't exit on single TUN write error
+			// Continue processing to avoid losing all buffered packets
 			if _, err := t.tunFile.Write(packet); err != nil {
 				select {
 				case <-t.stopCh:
-					// Tunnel is stopping, no need to log
+					// Tunnel is stopping, exit cleanly
+					return
 				default:
-					log.Printf("TUN write error: %v", err)
+					// Log error but continue processing other packets
+					// Common transient errors: "no buffer space available", "network is down"
+					log.Printf("⚠️  TUN write error (continuing): %v", err)
+					// Small backoff to avoid spinning on persistent errors
+					time.Sleep(10 * time.Millisecond)
 				}
-				return
 			}
 		}
 	}
@@ -2357,7 +2372,8 @@ func (t *Tunnel) handleClientPacket(client *ClientConnection, packet []byte) boo
 					forwardPacket := forwardBuf[:len(payload)]
 					copy(forwardPacket, payload)
 
-					queued := enqueueWithClientPolicy(targetClient.sendQueue, forwardPacket, t.stopCh, client.stopCh, t.fecEnabled)
+					// CRITICAL FIX: Never block on client-to-client forwarding
+					queued := enqueueWithClientPolicy(targetClient.sendQueue, forwardPacket, t.stopCh, client.stopCh, false)
 					if !queued {
 						atomic.AddUint64(&t.statQueueDropForward, 1)
 						log.Printf("⚠️  Target client send queue full for %s after timeout, dropping packet", dstIP)
@@ -2590,13 +2606,11 @@ func (t *Tunnel) handleP2PPacket(peerIP net.IP, data []byte) {
 
 	switch packetType {
 	case PacketTypeData:
-		// Queue for TUN device
-		select {
-		case t.recvQueue <- payload:
-		case <-t.stopCh:
-			return
-		default:
-			log.Printf("Receive queue full, dropping P2P packet from %s", peerIP)
+		// CRITICAL FIX: Use timeout-based enqueue instead of immediate drop
+		// P2P packets should have same treatment as regular packets
+		if !enqueueWithPolicy(t.recvQueue, payload, t.stopCh, false) {
+			atomic.AddUint64(&t.statQueueDropRecv, 1)
+			log.Printf("⚠️  Receive queue full after timeout, dropping P2P packet from %s", peerIP)
 		}
 	case PacketTypePeerInfo:
 		// Handle peer information advertisement
@@ -3294,7 +3308,8 @@ func (t *Tunnel) requestP2PConnection(targetIP net.IP) {
 // sendViaServer sends packet through the server connection
 // Uses timeout-based approach to handle queue congestion
 func (t *Tunnel) sendViaServer(packet []byte) (bool, error) {
-	if enqueueWithPolicy(t.sendQueue, packet, t.stopCh, t.fecEnabled) {
+	// CRITICAL FIX: Never block indefinitely when sending via server
+	if enqueueWithPolicy(t.sendQueue, packet, t.stopCh, false) {
 		return true, nil
 	}
 	return false, errors.New("send queue full after timeout")
