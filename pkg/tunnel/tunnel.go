@@ -471,9 +471,10 @@ func (t *Tunnel) handleRecoveredBatch(peerAddr string, sessionID uint32, packets
 	if len(packets) == 0 {
 		return
 	}
-	// Increased timeout to 200ms to handle high variance in worker completion time without breaking TCP streams
-	const reorderTimeout = 200 * time.Millisecond
-	const reorderWindowSize = 1024 // Increased window size significantly to handle high throughput queues
+	// Reordering timeout: trade-off between latency and dropped packets
+	// 20ms is aggressive enough to keep RTT low but allows small worker jitter
+	const reorderTimeout = 20 * time.Millisecond
+	const reorderWindowSize = 256 // Reduced slightly as strict worker affinity reduces massive reordering
 
 	t.fecReorderMux.Lock()
 	buf := t.fecReorderBufs[peerAddr]
@@ -4476,14 +4477,135 @@ func (t *Tunnel) fecWorker() {
 func (t *Tunnel) fecIngressWorker(queue chan *fecIngressWork) {
 	defer t.wg.Done()
 	
+	// Thread-Local Session Store
+	// Key: remoteAddr + sessionID (combined string to keep it simple, or struct key optimization)
+	// Using map optimization: struct key
+	type sessionKey struct { 
+		remoteAddr string
+		sessionID  uint32
+	}
+	sessions := make(map[sessionKey]*fecRecvSession)
+	
+	// Local cleanup ticker for this worker
+	cleanupTicker := time.NewTicker(2 * time.Second)
+	defer cleanupTicker.Stop()
+
 	for {
 		select {
 		case <-t.stopCh:
 			return
+		case <-cleanupTicker.C:
+			// Cleanup stale sessions local to this worker
+			now := time.Now()
+			for k, s := range sessions {
+				if now.Sub(s.lastUpdate) > 2*time.Second {
+					delete(sessions, k)
+				}
+			}
 		case work := <-queue:
-			sessionID, reconstructedPackets, err := t.processFECShard(work.remoteAddr, work.packet)
-			if err != nil {
+			// Inlined processFECShard logic with Local State
+			
+			// Simple packet validation (already done partly by sender, but double check)
+			if len(work.packet) < 12 {
 				continue
+			}
+			
+			fecPacket := work.packet
+			// Parse FEC header
+			sessionID := uint32(fecPacket[0])<<24 | uint32(fecPacket[1])<<16 | uint32(fecPacket[2])<<8 | uint32(fecPacket[3])
+			shardIndex := int(fecPacket[4])<<8 | int(fecPacket[5])
+			dataShards := int(fecPacket[6])<<8 | int(fecPacket[7])
+			parityShards := int(fecPacket[8])<<8 | int(fecPacket[9])
+			shardSize := int(fecPacket[10])<<8 | int(fecPacket[11])
+			shardData := fecPacket[12:]
+			atomic.AddUint64(&t.statFECShardsRecv, 1)
+
+			if dataShards <= 0 || parityShards <= 0 || shardSize <= 0 {
+				continue
+			}
+			// Sanity check size
+			if len(shardData) != shardSize {
+				continue
+			}
+			
+			totalShards := dataShards + parityShards
+			if shardIndex >= totalShards {
+				continue
+			}
+
+			key := sessionKey{work.remoteAddr, sessionID}
+			session, exists := sessions[key]
+			if !exists {
+				session = &fecRecvSession{
+					shards:            make([][]byte, totalShards),
+					shardPresent:      make([]bool, totalShards),
+					dataShards:        dataShards,
+					parityShards:      parityShards,
+					totalShards:       totalShards,
+					receivedCount:     0,
+					lastUpdate:        time.Now(),
+					expectedShardSize: shardSize,
+				}
+				sessions[key] = session
+			}
+
+			// Validate session parameters match
+			if session.dataShards != dataShards || session.parityShards != parityShards {
+				continue
+			}
+
+			// Add shard
+			if !session.shardPresent[shardIndex] {
+				session.shards[shardIndex] = make([]byte, len(shardData))
+				copy(session.shards[shardIndex], shardData)
+				session.shardPresent[shardIndex] = true
+				session.receivedCount++
+				session.lastUpdate = time.Now()
+			}
+			
+			// Check reconstruction
+			var reconstructedPackets [][]byte
+			if session.receivedCount >= session.dataShards {
+				// Mark missing as nil
+				for i := 0; i < session.totalShards; i++ {
+					if !session.shardPresent[i] {
+						session.shards[i] = nil
+					}
+				}
+
+				// Reconstruct using cached encoder if matches
+				var err error
+				useCached := false
+				if t.fec != nil && t.fec.DataShards() == session.dataShards && t.fec.ParityShards() == session.parityShards {
+					useCached = true
+					err = t.fec.Reconstruct(session.shards)
+				} else {
+					err = fec.ReconstructShards(session.shards, session.dataShards, session.parityShards)
+				}
+
+				if err == nil {
+					atomic.AddUint64(&t.statFECSessionsRecovered, 1)
+					// Extract packets
+					for i := 0; i < session.dataShards; i++ {
+						shard := session.shards[i]
+						if len(shard) < 2 { continue }
+						pktLen := int(binary.BigEndian.Uint16(shard[0:2]))
+						if pktLen > 1 && pktLen <= len(shard)-2 {
+							data := make([]byte, pktLen)
+							copy(data, shard[2:2+pktLen]) // Copy out
+							reconstructedPackets = append(reconstructedPackets, data)
+							atomic.AddUint64(&t.statFECPacketsRecovered, 1)
+						}
+					}
+					// Remove completed session immediately from local map
+					delete(sessions, key)
+				} else {
+					// wait later or give up if session.receivedCount >= totalShards
+					if session.receivedCount >= session.totalShards {
+						atomic.AddUint64(&t.statFECSessionsUnrecoverable, 1)
+						delete(sessions, key)
+					}
+				}
 			}
 
 			// If we got reconstructed packets, we need to handle them
