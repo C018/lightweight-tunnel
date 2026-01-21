@@ -4486,6 +4486,9 @@ func (t *Tunnel) fecIngressWorker(queue chan *fecIngressWork) {
 	}
 	sessions := make(map[sessionKey]*fecRecvSession)
 	
+	// Thread-Local Reorder Buffer (one per peer)
+	reorderBufs := make(map[string]*fecReorderBuffer)
+	
 	// Local cleanup ticker for this worker
 	cleanupTicker := time.NewTicker(2 * time.Second)
 	defer cleanupTicker.Stop()
@@ -4495,11 +4498,17 @@ func (t *Tunnel) fecIngressWorker(queue chan *fecIngressWork) {
 		case <-t.stopCh:
 			return
 		case <-cleanupTicker.C:
-			// Cleanup stale sessions local to this worker
+			// Cleanup stale sessions and reorder buffers local to this worker
 			now := time.Now()
 			for k, s := range sessions {
 				if now.Sub(s.lastUpdate) > 2*time.Second {
 					delete(sessions, k)
+				}
+			}
+			// Cleanup stale reorder buffers
+			for peerAddr, buf := range reorderBufs {
+				if now.Sub(buf.lastUpdate) > 10*time.Second && len(buf.pending) == 0 {
+					delete(reorderBufs, peerAddr)
 				}
 			}
 		case work := <-queue:
@@ -4575,9 +4584,7 @@ func (t *Tunnel) fecIngressWorker(queue chan *fecIngressWork) {
 
 				// Reconstruct using cached encoder if matches
 				var err error
-				useCached := false
 				if t.fec != nil && t.fec.DataShards() == session.dataShards && t.fec.ParityShards() == session.parityShards {
-					useCached = true
 					err = t.fec.Reconstruct(session.shards)
 				} else {
 					err = fec.ReconstructShards(session.shards, session.dataShards, session.parityShards)
@@ -4608,34 +4615,130 @@ func (t *Tunnel) fecIngressWorker(queue chan *fecIngressWork) {
 				}
 			}
 
-			// If we got reconstructed packets, we need to handle them
+			// If we got reconstructed packets, handle them with LOCAL reorder buffer
 			if len(reconstructedPackets) > 0 {
-				t.handleRecoveredBatch(work.remoteAddr, sessionID, reconstructedPackets, func(reconstructedPacket []byte) {
+				// Inline reordering logic with thread-local state
+				const reorderTimeout = 20 * time.Millisecond
+				const reorderWindowSize = 256
+				
+				buf := reorderBufs[work.remoteAddr]
+				if buf == nil {
+					buf = &fecReorderBuffer{
+						next:       sessionID,
+						pending:    make(map[uint32][][]byte),
+						lastUpdate: time.Now(),
+					}
+					reorderBufs[work.remoteAddr] = buf
+				}
+				
+				// Handle late batch
+				if sessionID < buf.next {
+					atomic.AddUint64(&t.statFECLateBatchDrop, 1)
+					for _, pkt := range reconstructedPackets {
+						// Deliver late packets anyway
+						if work.client != nil {
+							decryptedPacket, usedCipher, gen, err := t.decryptPacketFromClient(work.client, pkt)
+							if err == nil {
+								if usedCipher != nil {
+									work.client.setCipherWithGen(usedCipher, gen)
+								}
+								t.handleClientPacket(work.client, decryptedPacket)
+							}
+						} else {
+							select {
+							case t.fecDecryptionQueue <- [][]byte{pkt}:
+							default:
+								atomic.AddUint64(&t.statQueueDropRecv, 1)
+							}
+						}
+					}
+					continue
+				}
+				
+				// Buffer packet
+				windowEnd := buf.next + reorderWindowSize
+				if sessionID >= buf.next && sessionID < windowEnd {
+					buf.pending[sessionID] = reconstructedPackets
+					buf.lastUpdate = time.Now()
+				} else {
+					// Beyond window - skip gap
+					gapSize := sessionID - buf.next
+					atomic.AddUint64(&t.statFECGapSkip, uint64(gapSize))
+					buf.next = sessionID
+					buf.pending[sessionID] = reconstructedPackets
+					buf.lastUpdate = time.Now()
+					for sid := range buf.pending {
+						if sid < buf.next {
+							delete(buf.pending, sid)
+						}
+					}
+				}
+				
+				// Sequential delivery
+				var toDeliver [][]byte
+				for {
+					if pkts, ok := buf.pending[buf.next]; ok {
+						toDeliver = append(toDeliver, pkts...)
+						delete(buf.pending, buf.next)
+						buf.next++
+						buf.gapSince = time.Time{}
+					} else {
+						break
+					}
+				}
+				
+				// Timeout-based gap skip
+				if len(buf.pending) > 0 {
+					if buf.gapSince.IsZero() {
+						buf.gapSince = time.Now()
+					} else if time.Since(buf.gapSince) > reorderTimeout {
+						var minAvailable uint32
+						found := false
+						for sid := range buf.pending {
+							if sid > buf.next && (!found || sid < minAvailable) {
+								minAvailable = sid
+								found = true
+							}
+						}
+						if found {
+							gap := minAvailable - buf.next
+							atomic.AddUint64(&t.statFECGapSkip, uint64(gap))
+							buf.next = minAvailable
+							buf.gapSince = time.Time{}
+							if pkts, ok := buf.pending[buf.next]; ok {
+								toDeliver = append(toDeliver, pkts...)
+								delete(buf.pending, buf.next)
+								buf.next++
+							}
+						}
+					}
+				} else {
+					buf.gapSince = time.Time{}
+				}
+				
+				// Deliver all ordered packets
+				for _, reconstructedPacket := range toDeliver {
 					if work.client != nil {
 						// Server mode: Client specific logic
 						decryptedPacket, usedCipher, gen, err := t.decryptPacketFromClient(work.client, reconstructedPacket)
 						if err != nil {
-							// log.Printf("Worker: Decrypt failed for %s: %v", work.remoteAddr, err)
-							return
+							continue
 						}
 						
 						if usedCipher != nil {
 							work.client.setCipherWithGen(usedCipher, gen)
 						}
 						
-						if !t.handleClientPacket(work.client, decryptedPacket) {
-							// log.Printf("Worker: handleClientPacket returned false for %s", work.remoteAddr)
-						}
+						t.handleClientPacket(work.client, decryptedPacket)
 					} else {
 						// Client mode: Tunnel logic
-						// Send to decryption queue
 						select {
 						case t.fecDecryptionQueue <- [][]byte{reconstructedPacket}:
 						default:
 							atomic.AddUint64(&t.statQueueDropRecv, 1)
 						}
 					}
-				})
+				}
 			}
 		}
 	}
