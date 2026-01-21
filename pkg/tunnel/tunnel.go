@@ -658,9 +658,15 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 	}
 
 	// Initialize sharded ingress queues
+	// Each worker gets a large queue to handle bursty traffic without dropping
+	// Queue size is amplified because FEC generates many shards per original packet
+	ingressQueueSize := cfg.RecvQueueSize * 4 // 4x multiplier for FEC shard explosion
+	if ingressQueueSize < 16384 {
+		ingressQueueSize = 16384 // Minimum 16K per worker for high throughput
+	}
 	t.fecIngressQueues = make([]chan *fecIngressWork, cfg.SendWorkers)
 	for i := 0; i < cfg.SendWorkers; i++ {
-		t.fecIngressQueues[i] = make(chan *fecIngressWork, cfg.RecvQueueSize)
+		t.fecIngressQueues[i] = make(chan *fecIngressWork, ingressQueueSize)
 	}
 
 	t.packetPool = &sync.Pool{
@@ -4530,24 +4536,24 @@ func (t *Tunnel) fecIngressWorker(queue chan *fecIngressWork) {
 				// Buffer packet
 				windowEnd := buf.next + reorderWindowSize
 				if sessionID >= buf.next && sessionID < windowEnd {
-					buf.pending[sessionID] = reconstructedPackets
-					buf.lastUpdate = time.Now()
-				} else {
-					// Beyond window - skip gap
-					gapSize := sessionID - buf.next
-					atomic.AddUint64(&t.statFECGapSkip, uint64(gapSize))
-					buf.next = sessionID
-					buf.pending[sessionID] = reconstructedPackets
-					buf.lastUpdate = time.Now()
-					for sid := range buf.pending {
-						if sid < buf.next {
-							delete(buf.pending, sid)
-						}
+				// Within window: normal buffering
+				buf.pending[sessionID] = reconstructedPackets
+				buf.lastUpdate = time.Now()
+			} else if sessionID >= windowEnd {
+				// Beyond window: skip forward gap
+				gapSize := sessionID - buf.next
+				atomic.AddUint64(&t.statFECGapSkip, uint64(gapSize))
+				buf.next = sessionID
+				buf.pending[sessionID] = reconstructedPackets
+				buf.lastUpdate = time.Now()
+				// Clean up old pending entries
+				for sid := range buf.pending {
+					if sid < buf.next {
+						delete(buf.pending, sid)
 					}
 				}
-				
-				// Sequential delivery
-				var toDeliver [][]byte
+			}
+			// else: sessionID < buf.next - late packet, already handled above
 				for {
 					if pkts, ok := buf.pending[buf.next]; ok {
 						toDeliver = append(toDeliver, pkts...)
