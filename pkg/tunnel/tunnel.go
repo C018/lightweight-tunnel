@@ -76,6 +76,7 @@ const (
 	DefaultRouteAdvertInterval = 60 * time.Second
 
 	packetBufferSlack = 128 // Extra bytes to leave headroom for prepending headers without reallocations
+	fecQueueBurstFactor = 128 // Minimum packets per worker per shard to absorb FEC burst traffic
 )
 
 // enqueueWithPolicy enqueues a packet with optional blocking behavior.
@@ -140,6 +141,13 @@ func enqueueWithClientPolicy(queue chan []byte, packet []byte, stopCh, clientSto
 	case <-timer.C:
 		return false
 	}
+}
+
+func isFECEnabled(cfg *config.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	return cfg.FECDataShards > 0 && cfg.FECParityShards > 0
 }
 
 // ClientConnection represents a single client connection
@@ -615,9 +623,12 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 
 	// Create FEC encoder/decoder AFTER MTU adjustment
 	// This ensures FEC shard size accounts for encryption overhead
-	fecCodec, err := fec.NewFEC(cfg.FECDataShards, cfg.FECParityShards, cfg.MTU/cfg.FECDataShards)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create FEC: %v", err)
+	var fecCodec *fec.FEC
+	if isFECEnabled(cfg) {
+		fecCodec, err = fec.NewFEC(cfg.FECDataShards, cfg.FECParityShards, cfg.MTU/cfg.FECDataShards)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create FEC: %v", err)
+		}
 	}
 
 	packetBufSize := cfg.MTU + packetBufferSlack
@@ -639,6 +650,21 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 		log.Printf("⚠️  SendWorkers not configured or invalid, defaulting to %d", cfg.SendWorkers)
 	}
 
+	// Ensure queue sizes scale with FEC shard expansion to reduce burst drops.
+	fecShardMultiplier := 0
+	if isFECEnabled(cfg) {
+		fecShardMultiplier = cfg.FECDataShards + cfg.FECParityShards
+		minQueueSize := fecShardMultiplier * cfg.SendWorkers * fecQueueBurstFactor
+		if cfg.SendQueueSize < minQueueSize {
+			log.Printf("⚠️  Increasing send queue size from %d to %d to match FEC burst size", cfg.SendQueueSize, minQueueSize)
+			cfg.SendQueueSize = minQueueSize
+		}
+		if cfg.RecvQueueSize < minQueueSize {
+			log.Printf("⚠️  Increasing recv queue size from %d to %d to match FEC burst size", cfg.RecvQueueSize, minQueueSize)
+			cfg.RecvQueueSize = minQueueSize
+		}
+	}
+
 	t := &Tunnel{
 		config:             cfg,
 		configFilePath:     configFilePath,
@@ -651,16 +677,20 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 		allClients:         make(map[*ClientConnection]struct{}),
 		xdpAccel:           accel,
 		pendingP2PRequests: make(map[string]time.Time),
-		fecEnabled:         cfg.FECDataShards > 0 && cfg.FECParityShards > 0,
+		fecEnabled:         isFECEnabled(cfg),
 		fecSessionID:       uint32(time.Now().UnixNano()),
 		fecWorkQueue:       make(chan *fecBatchWork, cfg.SendQueueSize), // Reuse send queue size for work queue
-		fecDecryptionQueue: make(chan [][]byte, cfg.SendQueueSize*2),    // Queue for parallel decryption
+		fecDecryptionQueue: make(chan [][]byte, cfg.RecvQueueSize*2),    // Sized for receive bursts (parallel decrypt)
 	}
 
 	// Initialize sharded ingress queues
 	// Each worker gets a large queue to handle bursty traffic without dropping
 	// Queue size is amplified because FEC generates many shards per original packet
-	ingressQueueSize := cfg.RecvQueueSize * 4 // 4x multiplier for FEC shard explosion
+	ingressMultiplier := 4
+	if fecShardMultiplier > 0 {
+		ingressMultiplier = fecShardMultiplier
+	}
+	ingressQueueSize := cfg.RecvQueueSize * ingressMultiplier
 	if ingressQueueSize < 16384 {
 		ingressQueueSize = 16384 // Minimum 16K per worker for high throughput
 	}
@@ -4779,4 +4809,3 @@ func (t *Tunnel) sendBatchWithFEC(conn faketcp.ConnAdapter, packets [][]byte, pa
 
 	return nil
 }
-
