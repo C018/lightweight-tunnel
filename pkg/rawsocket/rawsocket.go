@@ -57,7 +57,6 @@ func NewRawSocket(localIP net.IP, localPort uint16, remoteIP net.IP, remotePort 
 	// Ignore errors as some systems might restrict max buffer size
 	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, 16*1024*1024)
 	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, 16*1024*1024)
-	_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
 
 	// Bind to local address if server
 	if isServer && localIP != nil {

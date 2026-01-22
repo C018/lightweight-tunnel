@@ -76,6 +76,7 @@ const (
 	DefaultRouteAdvertInterval = 60 * time.Second
 
 	packetBufferSlack = 128 // Extra bytes to leave headroom for prepending headers without reallocations
+	fecQueueBurstFactor = 128 // Minimum packets per worker per shard to absorb FEC burst traffic
 )
 
 // enqueueWithPolicy enqueues a packet with optional blocking behavior.
@@ -645,7 +646,7 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 	// Ensure queue sizes scale with FEC shard expansion to reduce burst drops.
 	if cfg.FECDataShards > 0 && cfg.FECParityShards > 0 {
 		shardMultiplier := cfg.FECDataShards + cfg.FECParityShards
-		minQueueSize := shardMultiplier * cfg.SendWorkers * 128
+		minQueueSize := shardMultiplier * cfg.SendWorkers * fecQueueBurstFactor
 		if cfg.SendQueueSize < minQueueSize {
 			log.Printf("⚠️  Increasing send queue size from %d to %d to match FEC burst size", cfg.SendQueueSize, minQueueSize)
 			cfg.SendQueueSize = minQueueSize
