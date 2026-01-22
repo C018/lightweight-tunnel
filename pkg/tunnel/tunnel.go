@@ -687,8 +687,7 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 	}
 	t.fecIngressQueues = make([]chan *fecIngressWork, cfg.SendWorkers)
 	for i := 0; i < cfg.SendWorkers; i++ {
-		queueSize := ingressQueueSize
-		t.fecIngressQueues[i] = make(chan *fecIngressWork, queueSize)
+		t.fecIngressQueues[i] = make(chan *fecIngressWork, ingressQueueSize)
 	}
 
 	t.packetPool = &sync.Pool{
