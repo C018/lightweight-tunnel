@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	rawRecvQueueSize = 4096 // large buffer to avoid drops under high throughput
+	rawRecvQueueSize = 16384 // larger buffer to avoid drops under high throughput
 )
 
 // ConnRaw represents a fake TCP connection using raw sockets (真正的TCP伪装)

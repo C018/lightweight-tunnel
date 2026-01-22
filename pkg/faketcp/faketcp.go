@@ -50,8 +50,8 @@ type Tuning struct {
 }
 
 var tunables = Tuning{
-	ListenerQueueSize:   128,  // Increased default (was 8)
-	RecvQueueSize:       4096, // Increased default (was 100)
+	ListenerQueueSize:   128,   // Increased default (was 8)
+	RecvQueueSize:       16384, // Increased default (was 100)
 	HandshakeMaxErrors:  2,
 	WritePacingMinDelay: 0,
 	MaxSegmentSize:      1400,

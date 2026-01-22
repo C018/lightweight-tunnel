@@ -212,8 +212,8 @@ sudo ./lightweight-tunnel -c configs/low-spec-client.json
 -mtu int              MTU 大小（0=自动检测，默认 1400）
 -fec-data int         FEC 数据分片（默认 10）
 -fec-parity int       FEC 校验分片（默认 3）
--send-queue int       发送队列大小（默认 5000）
--recv-queue int       接收队列大小（默认 5000）
+-send-queue int       发送队列大小（默认 5000，FEC 模式会自动放大）
+-recv-queue int       接收队列大小（默认 5000，FEC 模式会自动放大）
 ```
 
 **功能开关**
@@ -456,7 +456,7 @@ echo "tun" | sudo tee -a /etc/modules
 **队列满错误**
 ```
 错误：Send queue full, dropping packet
-解决：增加队列大小或减少客户端数量
+解决：增加队列大小或减少客户端数量；FEC 模式会自动放大队列
 ```
 ```bash
 -send-queue 10000 -recv-queue 10000

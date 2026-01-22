@@ -19,7 +19,8 @@ const (
 	// TUN I/O polling interval when device would block.
 	// The device is opened in blocking mode, so this is only a defensive fallback
 	// for kernels/drivers that may still surface EAGAIN/EWOULDBLOCK occasionally.
-	tunPollInterval = 10 * time.Millisecond
+	// Keep this short to reduce backlog when short bursts exceed kernel buffers.
+	tunPollInterval = 1 * time.Millisecond
 )
 
 // TunDevice represents a TUN network device
