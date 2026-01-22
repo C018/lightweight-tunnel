@@ -2161,10 +2161,20 @@ func (t *Tunnel) netWriter() {
 			parityShards: parityShards,
 		}
 		
+		// Use timeout to avoid blocking indefinitely
+		timer := time.NewTimer(QueueSendTimeout)
 		select {
 		case t.fecWorkQueue <- work:
+			timer.Stop()
 			// Dispatched
+		case <-timer.C:
+			// Queue full, drop packets and clean up
+			for _, pkt := range workBatch {
+				t.releasePacketBuffer(pkt)
+			}
+			atomic.AddUint64(&t.statQueueDropSend, 1)
 		case <-t.stopCh:
+			timer.Stop()
 			// Tunnel stopping
 			for _, pkt := range workBatch {
 				t.releasePacketBuffer(pkt)
@@ -4688,11 +4698,16 @@ func (t *Tunnel) fecIngressWorker(queue chan *fecIngressWork) {
 						
 						t.handleClientPacket(work.client, decryptedPacket)
 					} else {
-						// Client mode: Tunnel logic
+						// Client mode: Tunnel logic - use timeout to avoid blocking
+						timer := time.NewTimer(QueueSendTimeout)
 						select {
 						case t.fecDecryptionQueue <- [][]byte{reconstructedPacket}:
-						default:
+							timer.Stop()
+						case <-timer.C:
 							atomic.AddUint64(&t.statQueueDropRecv, 1)
+						case <-t.stopCh:
+							timer.Stop()
+							return
 						}
 					}
 				}
