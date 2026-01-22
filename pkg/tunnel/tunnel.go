@@ -687,7 +687,7 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 	// Each worker gets a large queue to handle bursty traffic without dropping
 	// Queue size is amplified because FEC generates many shards per original packet
 	ingressQueueSize := cfg.RecvQueueSize * 4 // 4x multiplier for FEC shard explosion
-	if shardMultiplier > 0 {
+	if isFECEnabled(cfg) {
 		ingressQueueSize = cfg.RecvQueueSize * shardMultiplier
 	}
 	if ingressQueueSize < 16384 {
