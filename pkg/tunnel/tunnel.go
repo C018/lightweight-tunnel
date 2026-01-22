@@ -476,6 +476,22 @@ func (t *Tunnel) nextFECSessionID() uint32 {
 	return atomic.AddUint32(&t.fecSessionID, 1)
 }
 
+// enqueueFECDecryption enqueues a packet batch to the FEC decryption queue with timeout handling
+func (t *Tunnel) enqueueFECDecryption(batch [][]byte) bool {
+	timer := time.NewTimer(QueueSendTimeout)
+	defer timer.Stop()
+	
+	select {
+	case t.fecDecryptionQueue <- batch:
+		return true
+	case <-timer.C:
+		atomic.AddUint64(&t.statQueueDropRecv, 1)
+		return false
+	case <-t.stopCh:
+		return false
+	}
+}
+
 // NewTunnel creates a new tunnel instance
 func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 	// Force rawtcp mode - this is the only supported transport now
@@ -686,9 +702,11 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 	// Initialize sharded ingress queues
 	// Queue size should be reasonable to avoid excessive memory usage
 	// Use a smaller multiplier to prevent packet accumulation
+	const maxShardMultiplierForIngressQueue = 6 // Above this, use half the multiplier
 	ingressMultiplier := 2
-	if fecShardMultiplier > 0 && fecShardMultiplier < 6 {
-		ingressMultiplier = fecShardMultiplier / 2
+	if fecShardMultiplier > 0 && fecShardMultiplier < maxShardMultiplierForIngressQueue {
+		// Round up to avoid truncation: (fecShardMultiplier + 1) / 2
+		ingressMultiplier = (fecShardMultiplier + 1) / 2
 		if ingressMultiplier < 2 {
 			ingressMultiplier = 2
 		}
@@ -2144,6 +2162,13 @@ func (t *Tunnel) netWriter() {
 		}
 		flushTimer.Reset(fecBatchTimeout)
 	}
+	
+	// Helper function to clean up batch packets
+	cleanupBatch := func(workBatch [][]byte) {
+		for _, pkt := range workBatch {
+			t.releasePacketBuffer(pkt)
+		}
+	}
 
 	flushBatch := func(parityShards int) {
 		if len(batch) == 0 {
@@ -2169,16 +2194,12 @@ func (t *Tunnel) netWriter() {
 			// Dispatched
 		case <-timer.C:
 			// Queue full, drop packets and clean up
-			for _, pkt := range workBatch {
-				t.releasePacketBuffer(pkt)
-			}
+			cleanupBatch(workBatch)
 			atomic.AddUint64(&t.statQueueDropSend, 1)
 		case <-t.stopCh:
 			timer.Stop()
 			// Tunnel stopping
-			for _, pkt := range workBatch {
-				t.releasePacketBuffer(pkt)
-			}
+			cleanupBatch(workBatch)
 			return
 		}
 
@@ -4603,16 +4624,16 @@ func (t *Tunnel) fecIngressWorker(queue chan *fecIngressWork) {
 								t.handleClientPacket(work.client, decryptedPacket)
 							}
 						} else {
-							// Use select with timeout to avoid blocking
-							timer := time.NewTimer(QueueSendTimeout)
-							select {
-							case t.fecDecryptionQueue <- [][]byte{pkt}:
-								timer.Stop()
-							case <-timer.C:
-								atomic.AddUint64(&t.statQueueDropRecv, 1)
-							case <-t.stopCh:
-								timer.Stop()
-								return
+							// Use helper to enqueue with timeout
+							if !t.enqueueFECDecryption([][]byte{pkt}) {
+								// Already logged in helper
+								if t.stopCh != nil {
+									select {
+									case <-t.stopCh:
+										return
+									default:
+									}
+								}
 							}
 						}
 					}
@@ -4698,16 +4719,14 @@ func (t *Tunnel) fecIngressWorker(queue chan *fecIngressWork) {
 						
 						t.handleClientPacket(work.client, decryptedPacket)
 					} else {
-						// Client mode: Tunnel logic - use timeout to avoid blocking
-						timer := time.NewTimer(QueueSendTimeout)
-						select {
-						case t.fecDecryptionQueue <- [][]byte{reconstructedPacket}:
-							timer.Stop()
-						case <-timer.C:
-							atomic.AddUint64(&t.statQueueDropRecv, 1)
-						case <-t.stopCh:
-							timer.Stop()
-							return
+						// Client mode: Tunnel logic - use helper to enqueue with timeout
+						if !t.enqueueFECDecryption([][]byte{reconstructedPacket}) {
+							// Already logged in helper
+							select {
+							case <-t.stopCh:
+								return
+							default:
+							}
 						}
 					}
 				}
