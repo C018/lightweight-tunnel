@@ -651,10 +651,10 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 	}
 
 	// Ensure queue sizes scale with FEC shard expansion to reduce burst drops.
-	shardMultiplier := 0
+	fecShardMultiplier := 0
 	if isFECEnabled(cfg) {
-		shardMultiplier = cfg.FECDataShards + cfg.FECParityShards
-		minQueueSize := shardMultiplier * cfg.SendWorkers * fecQueueBurstFactor
+		fecShardMultiplier = cfg.FECDataShards + cfg.FECParityShards
+		minQueueSize := fecShardMultiplier * cfg.SendWorkers * fecQueueBurstFactor
 		if cfg.SendQueueSize < minQueueSize {
 			log.Printf("⚠️  Increasing send queue size from %d to %d to match FEC burst size", cfg.SendQueueSize, minQueueSize)
 			cfg.SendQueueSize = minQueueSize
@@ -686,10 +686,11 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 	// Initialize sharded ingress queues
 	// Each worker gets a large queue to handle bursty traffic without dropping
 	// Queue size is amplified because FEC generates many shards per original packet
-	ingressQueueSize := cfg.RecvQueueSize * 4 // 4x multiplier for FEC shard explosion
-	if isFECEnabled(cfg) {
-		ingressQueueSize = cfg.RecvQueueSize * shardMultiplier
+	ingressMultiplier := 4
+	if fecShardMultiplier > 0 {
+		ingressMultiplier = fecShardMultiplier
 	}
+	ingressQueueSize := cfg.RecvQueueSize * ingressMultiplier
 	if ingressQueueSize < 16384 {
 		ingressQueueSize = 16384 // Minimum 16K per worker for high throughput
 	}
