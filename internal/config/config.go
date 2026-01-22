@@ -71,8 +71,8 @@ func DefaultConfig() *Config {
 		FECParityShards:      2,
 		Timeout:              30,
 		KeepaliveInterval:    5,    // Reduced from 10 to 5 seconds for faster detection of connection issues
-		RecvQueueSize:        4096, // Increased to absorb bursts
-		SendQueueSize:        4096, // Increased to absorb bursts
+		RecvQueueSize:        2048, // Reasonable to prevent excessive accumulation
+		SendQueueSize:        2048, // Reasonable to prevent excessive accumulation
 		TunName:              "",
 		Routes:               []string{},
 		ConfigPushInterval:   0,
@@ -132,10 +132,10 @@ func LoadConfig(filename string) (*Config, error) {
 		config.KeepaliveInterval = 5 // Default to 5 seconds for aggressive connection health monitoring
 	}
 	if config.SendQueueSize == 0 {
-		config.SendQueueSize = 10000 // Increased default to handle high bandwidth
+		config.SendQueueSize = 2048 // Reasonable default to prevent excessive accumulation
 	}
 	if config.RecvQueueSize == 0 {
-		config.RecvQueueSize = 10000 // Increased default to handle high bandwidth
+		config.RecvQueueSize = 2048 // Reasonable default to prevent excessive accumulation
 	}
 	if config.SendWorkers == 0 {
 		config.SendWorkers = 4
