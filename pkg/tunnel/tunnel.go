@@ -58,7 +58,7 @@ const (
 	P2PMaxBackoffSeconds           = 32 // Maximum backoff delay in seconds
 
 	// Queue management constants
-	QueueSendTimeout = 200 * time.Millisecond // Timeout for queue send operations to handle temporary congestion (increased for high-latency networks)
+	QueueSendTimeout = 50 * time.Millisecond // Timeout for queue send operations to handle temporary congestion
 
 	// Connection health constants
 	// IdleConnectionTimeout is the maximum time without receiving packets before considering connection dead.
@@ -684,15 +684,22 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 	}
 
 	// Initialize sharded ingress queues
-	// Each worker gets a large queue to handle bursty traffic without dropping
-	// Queue size is amplified because FEC generates many shards per original packet
-	ingressMultiplier := 4
-	if fecShardMultiplier > 0 {
-		ingressMultiplier = fecShardMultiplier
+	// Queue size should be reasonable to avoid excessive memory usage
+	// Use a smaller multiplier to prevent packet accumulation
+	ingressMultiplier := 2
+	if fecShardMultiplier > 0 && fecShardMultiplier < 6 {
+		ingressMultiplier = fecShardMultiplier / 2
+		if ingressMultiplier < 2 {
+			ingressMultiplier = 2
+		}
 	}
 	ingressQueueSize := cfg.RecvQueueSize * ingressMultiplier
-	if ingressQueueSize < 16384 {
-		ingressQueueSize = 16384 // Minimum 16K per worker for high throughput
+	// Cap the queue size to prevent excessive memory usage
+	if ingressQueueSize > 8192 {
+		ingressQueueSize = 8192 // Maximum 8K per worker to prevent accumulation
+	}
+	if ingressQueueSize < 2048 {
+		ingressQueueSize = 2048 // Minimum 2K per worker
 	}
 	t.fecIngressQueues = make([]chan *fecIngressWork, cfg.SendWorkers)
 	for i := 0; i < cfg.SendWorkers; i++ {
@@ -2117,7 +2124,7 @@ func (t *Tunnel) netWriter() {
 	}
 
 	// FEC enabled: batch packets within a short window for cross-packet recovery
-	const fecBatchTimeout = 2 * time.Millisecond
+	const fecBatchTimeout = 5 * time.Millisecond
 	dataShards := t.config.FECDataShards
 	batch := make([][]byte, 0, dataShards)
 	flushTimer := time.NewTimer(fecBatchTimeout)
@@ -2516,7 +2523,7 @@ func (t *Tunnel) clientNetWriter(client *ClientConnection) {
 	}
 
 	// FEC enabled: batch packets within a short window for cross-packet recovery
-	const fecBatchTimeout = 2 * time.Millisecond
+	const fecBatchTimeout = 5 * time.Millisecond
 	dataShards := t.config.FECDataShards
 	batch := make([][]byte, 0, dataShards)
 	flushTimer := time.NewTimer(fecBatchTimeout)
@@ -4586,10 +4593,16 @@ func (t *Tunnel) fecIngressWorker(queue chan *fecIngressWork) {
 								t.handleClientPacket(work.client, decryptedPacket)
 							}
 						} else {
+							// Use select with timeout to avoid blocking
+							timer := time.NewTimer(QueueSendTimeout)
 							select {
 							case t.fecDecryptionQueue <- [][]byte{pkt}:
-							default:
+								timer.Stop()
+							case <-timer.C:
 								atomic.AddUint64(&t.statQueueDropRecv, 1)
+							case <-t.stopCh:
+								timer.Stop()
+								return
 							}
 						}
 					}
