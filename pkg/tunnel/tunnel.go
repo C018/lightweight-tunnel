@@ -672,7 +672,7 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 		fecEnabled:         cfg.FECDataShards > 0 && cfg.FECParityShards > 0,
 		fecSessionID:       uint32(time.Now().UnixNano()),
 		fecWorkQueue:       make(chan *fecBatchWork, cfg.SendQueueSize), // Reuse send queue size for work queue
-		fecDecryptionQueue: make(chan [][]byte, cfg.RecvQueueSize*2),    // Queue for parallel decryption
+		fecDecryptionQueue: make(chan [][]byte, cfg.RecvQueueSize*2),    // Sized for receive bursts (parallel decrypt)
 	}
 
 	// Initialize sharded ingress queues
@@ -688,9 +688,6 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 	t.fecIngressQueues = make([]chan *fecIngressWork, cfg.SendWorkers)
 	for i := 0; i < cfg.SendWorkers; i++ {
 		queueSize := ingressQueueSize
-		if queueSize < cfg.RecvQueueSize {
-			queueSize = cfg.RecvQueueSize
-		}
 		t.fecIngressQueues[i] = make(chan *fecIngressWork, queueSize)
 	}
 
